@@ -1,5 +1,17 @@
 'use strict';
 
+// Pinned to 1.x deliberately -- DO NOT bump to 2.x. Verdaccio's own core
+// publish handler still bundles body-parser@1.20.5 internally, and 1.x/2.x
+// don't safely chain: 1.x's read() flags an already-consumed request via an
+// explicit req._body flag set synchronously; 2.x instead checks
+// onFinished.isFinished(req), an async/event-based signal that can still
+// read false immediately after a *different* body-parser instance already
+// fully drained the stream. Confirmed by direct repro (chaining this
+// plugin's own bodyParser.json() ahead of Verdaccio's bundled 1.x instance
+// on one real request): 1-then-1 and 2-then-2 both work, but 2-then-1 fails
+// every time with "stream is not readable" -- silently breaking every
+// publish once this middleware's own parser has already run. Only safe to
+// upgrade this once Verdaccio's own bundled body-parser also moves to 2.x.
 const bodyParser = require('body-parser');
 const semver = require('semver');
 const {minimatch} = require('minimatch');
@@ -476,7 +488,7 @@ class Attestations {
 
       this._parseJsonBody(req, res, err => {
         if (err) return next(err);
-        this._interceptPublish(req, packageName).finally(() => next());
+        this._interceptPublish(req, res, packageName).finally(() => next());
       });
     });
 
@@ -499,7 +511,7 @@ class Attestations {
   // generic per-package blob storage the tarball itself uses, and injects
   // dist.attestations into the version metadata in the same request body --
   // so Verdaccio's own addVersion() persists it with no separate hook.
-  async _interceptPublish(req, packageName) {
+  async _interceptPublish(req, res, packageName) {
     const body = req.body;
     if (!body?._attachments || !body?.versions) return; // not a real publish (e.g. deprecate/star)
 
@@ -540,19 +552,42 @@ class Attestations {
           reason: 'no dist.integrity on published version metadata',
         };
 
-    try {
+    // Deferred to the response's own 'finish' event, not stored inline here:
+    // for a brand-new package's very first publish, the package has no
+    // record in storage yet at this point -- this middleware runs before
+    // Verdaccio's own core publish handler (reached only via next(), below)
+    // has actually created it, and storage.addTarball() requires that
+    // record to already exist (confirmed against verdaccio's own
+    // local-storage.js: it 404s with "no such package available"
+    // otherwise). Waiting for 'finish' guarantees Verdaccio has already
+    // committed the package by the time this runs -- true for a
+    // pre-existing package's publish too, so this is never later than
+    // necessary. Checking res.statusCode also means a publish some other
+    // downstream check (e.g. security-filter's own gate) ends up rejecting
+    // never gets an orphaned verdict object stored for a version that was
+    // never actually published.
+    res.on('finish', () => {
+      if (res.statusCode >= 300) return;
       // One stored object, named by verdict -- not stored separately from
       // the packument's own dist.attestations below, but kept independent
       // of it too: discoverable directly from storage (e.g. for tooling or
       // a rebuild) and reuses the exact same lookup path proxied packages
-      // rely on via _readStoredVerdict().
-      await this._storeVerdictAndBundle(packageName, version, bundle, result);
-    } catch (err) {
-      this.logger.error(
-        {pkg: packageName, ver: version, err: err.message},
-        'verdaccio-attestations: failed to store attestation bundle/verdict',
+      // rely on via _readStoredVerdict(). Tracked via _trackBackground, the
+      // same mechanism the background verdict-resolution path already uses,
+      // so a caller (tests, mainly) can deterministically await it via
+      // whenAllBackgroundWorkSettles() instead of racing the 'finish' event
+      // against this fire-and-forget write actually completing.
+      this._trackBackground(
+        `publish:${packageName}@${version}`,
+        this._storeVerdictAndBundle(packageName, version, bundle, result).catch(
+          err =>
+            this.logger.error(
+              {pkg: packageName, ver: version, err: err.message},
+              'verdaccio-attestations: failed to store attestation bundle/verdict',
+            ),
+        ),
       );
-    }
+    });
     this._verdictCache.set(`${packageName}@${version}`, result);
 
     versionMeta.dist = versionMeta.dist ?? {};

@@ -97,6 +97,23 @@ function makeAttestations(config, overrides = {}) {
   });
 }
 
+// _interceptPublish defers its storage write to res.on('finish', ...) (see
+// index.js for why -- a brand-new package's first publish has no record in
+// storage yet at interception time). This fake res lets tests trigger that
+// event on demand instead of needing a real HTTP response cycle.
+function makeFakeRes(statusCode = 201) {
+  let finishCb;
+  return {
+    statusCode,
+    on(event, cb) {
+      if (event === 'finish') finishCb = cb;
+    },
+    _triggerFinish() {
+      finishCb?.();
+    },
+  };
+}
+
 function makePackageInfo(name, versions) {
   const time = {};
   for (const v of Object.keys(versions)) time[v] = '2025-01-01T00:00:00Z';
@@ -508,7 +525,7 @@ async function main() {
         versions: {'1.0.0': {version: '1.0.0', dist: {}}},
         _attachments: {'plain-pkg-1.0.0.tgz': {data: 'ZmFrZQ=='}},
       };
-      await plugin._interceptPublish({body}, 'plain-pkg');
+      await plugin._interceptPublish({body}, makeFakeRes(), 'plain-pkg');
       assert.equal(Object.keys(body._attachments).length, 1);
       assert.ok(!body.versions['1.0.0'].dist.attestations);
     },
@@ -535,7 +552,8 @@ async function main() {
         },
       };
 
-      await plugin._interceptPublish({body}, '@actions/core');
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish({body}, res, '@actions/core');
 
       assert.equal(
         Object.keys(body._attachments).length,
@@ -552,11 +570,111 @@ async function main() {
       );
 
       assert.ok(
+        !storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+        'must not be stored yet -- only once the response actually finishes',
+      );
+
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.ok(
         storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
         'a single .good object (verdict encoded in the extension) must hold the bundle -- no separate marker file',
       );
       assert.ok(
         !storage.files.has('@actions/core\x00@actions-core-3.0.1.sigstore'),
+      );
+    },
+  );
+
+  await check(
+    'a brand-new package (no record in storage yet) still gets its attestation stored -- deferred past the moment the package is actually created',
+    async () => {
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+      // Simulates Verdaccio's own local-storage.js: addTarball() 404s with
+      // "no such package available" until the package has been created --
+      // which for a brand-new package's first publish only happens in
+      // Verdaccio's own core handler, downstream of this middleware.
+      let packageExists = false;
+      const realAddTarball = storage.addTarball.bind(storage);
+      storage.addTarball = (name, filename) => {
+        if (!packageExists) {
+          const emitter = new EventEmitter();
+          process.nextTick(() =>
+            emitter.emit(
+              'error',
+              Object.assign(new Error('no such package available'), {
+                code: 'ENOENT',
+              }),
+            ),
+          );
+          emitter.abort = () => {};
+          return emitter;
+        }
+        return realAddTarball(name, filename);
+      };
+      plugin._storage = storage;
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        name: '@actions/core',
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+        _attachments: {
+          '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
+          '@actions/core-3.0.1.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+      };
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish({body}, res, '@actions/core');
+
+      // Verdaccio's own core publish handler (downstream of this
+      // middleware, reached via next()) is what actually creates the
+      // package -- simulated here as happening sometime before 'finish'.
+      packageExists = true;
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.ok(
+        storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+        'must succeed once retried after the package actually exists',
+      );
+    },
+  );
+
+  await check(
+    'a publish some other downstream check ends up rejecting never gets an attestation stored',
+    async () => {
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+      plugin._storage = storage;
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        name: '@actions/core',
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+        _attachments: {
+          '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
+          '@actions/core-3.0.1.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+      };
+      // e.g. security-filter's own publish gate rejected it downstream.
+      const res = makeFakeRes(403);
+      await plugin._interceptPublish({body}, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.ok(
+        !storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+        'a rejected publish must never leave an orphaned verdict object in storage',
       );
     },
   );
@@ -587,7 +705,10 @@ async function main() {
         },
       };
 
-      await plugin._interceptPublish({body}, '@actions/core');
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish({body}, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
 
       assert.equal(Object.keys(body._attachments).length, 1);
       assert.equal(body.versions['3.0.1'].dist.attestations.verified, false);

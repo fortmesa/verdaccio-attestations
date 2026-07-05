@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-attestations",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Verdaccio plugin: accepts and stores npm provenance/Sigstore attestations on publish (working around Verdaccio's own single-attachment publish limit), serves them back via the real npm attestations endpoint (proxying and caching from upstream for non-local packages), and optionally enforces that matching packages have a cryptographically verified attestation before they can be installed",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-attestations",
@@ -33,7 +33,7 @@
     ]
   },
   "dependencies": {
-    "body-parser": "^2.2.1",
+    "body-parser": "^1.20.5",
     "https-proxy-agent": "^9.1.0",
     "minimatch": "^10.2.5",
     "node-fetch": "^2.7.0",
