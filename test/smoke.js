@@ -6,8 +6,23 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
-const {Attestations} = require('../index.js');
+const {
+  Attestations,
+  requestContext,
+  __resetSharedStateForTests,
+} = require('../index.js');
 const {verifyBundle, verifyAttestationsResponse} = require('../verify.js');
+
+// Simulates "a real, non-offline-restricted request came in" around a
+// direct method call (filter_metadata/_handleGetAttestations/etc.) that
+// doesn't go through register_middlewares' own Express middleware chain --
+// real request handling establishes this itself; a unit test calling a
+// plugin method directly has to do it explicitly, or _effectiveFetchUpstream()
+// fails closed (no request context = no fetch), same as it would for a
+// genuine non-HTTP code path.
+function asOnlineRequest(fn) {
+  return requestContext.run({offlineRestricted: false}, fn);
+}
 
 const NOOP_LOGGER = {warn() {}, error() {}, info() {}, fatal() {}};
 
@@ -34,10 +49,15 @@ function realKeyedBundle() {
   ).bundle;
 }
 
-// Mirrors Verdaccio's real addTarball/getTarball contract (verified this
-// session against verdaccio/build/lib/storage.js and publish.js): custom
-// 'error'/'success' events on write, a readable-style 'data'/'end'/'error'
-// stream on read -- not a plain Node stream.
+// Mirrors Verdaccio's real addTarball/getTarball/removeTarball contract
+// (verified this session against verdaccio/build/lib/local-storage.js and
+// publish.js): custom 'error'/'success' events on write, a readable-style
+// 'data'/'end'/'error' stream on read, a plain (packageName, filename,
+// revision, callback) shape on remove -- not a plain Node stream. This is
+// the shape of storage.localStorage specifically (the safe, lower-level
+// class), not the top-level Storage object register_middlewares() actually
+// receives -- see wrapAsTopLevelStorage() below for the distinction that
+// matters to this plugin's own code.
 function makeFakeStorage() {
   const files = new Map(); // "pkg\x00filename" -> Buffer
   return {
@@ -64,7 +84,10 @@ function makeFakeStorage() {
         if (!data) {
           emitter.emit(
             'error',
-            Object.assign(new Error('not found'), {code: 'ENOENT'}),
+            Object.assign(new Error('not found'), {
+              code: 'ENOENT',
+              status: 404,
+            }),
           );
           return;
         }
@@ -73,7 +96,44 @@ function makeFakeStorage() {
       });
       return emitter;
     },
+    removeTarball(packageName, filename, revision, callback) {
+      const key = `${packageName}\x00${filename}`;
+      process.nextTick(() => {
+        if (!files.has(key)) {
+          callback(
+            Object.assign(new Error('no such file available'), {code: 404}),
+          );
+          return;
+        }
+        files.delete(key);
+        callback(null);
+      });
+    },
   };
+}
+
+// Minimal fake req for direct _interceptPublish() calls -- needs .protocol
+// and .get('host') since dist.attestations.url is built from them (must be
+// absolute, see index.js's comment on that field), which a bare {body}
+// object doesn't provide the way a real Express req does.
+function makeFakeReq(body) {
+  return {
+    body,
+    protocol: 'http',
+    get: header => (header === 'host' ? 'localhost:4873' : undefined),
+  };
+}
+
+// The plugin's own _getLocalStorage() reads storage.localStorage, matching
+// the REAL Storage class register_middlewares() actually receives (its own
+// addTarball/getTarball must never be used directly -- see index.js's
+// comment on _getLocalStorage() for why). Every test that assigns
+// plugin._storage or calls register_middlewares() with a fake storage needs
+// this wrapping now; the returned localStorage sub-object is still the
+// same one makeFakeStorage() produces, so `.files` introspection on it is
+// unaffected.
+function wrapAsTopLevelStorage(localStorage) {
+  return {localStorage};
 }
 
 // keyed by "<name>@<version>" -- default throws, since a test that expects
@@ -370,26 +430,28 @@ async function main() {
           },
         },
       );
-      plugin._storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
 
       const pkg = makePackageInfo('@actions/core', {
         '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
       });
 
-      const first = await plugin.filter_metadata(structuredClone(pkg));
-      assert.ok(
-        !('3.0.1' in first.versions),
-        'must be blocked on the very first read -- there is no way to have a real verdict yet without waiting on the network',
-      );
+      await asOnlineRequest(async () => {
+        const first = await plugin.filter_metadata(structuredClone(pkg));
+        assert.ok(
+          !('3.0.1' in first.versions),
+          'must be blocked on the very first read -- there is no way to have a real verdict yet without waiting on the network',
+        );
 
-      await plugin.whenAllBackgroundWorkSettles();
+        await plugin.whenAllBackgroundWorkSettles();
 
-      const second = await plugin.filter_metadata(structuredClone(pkg));
-      assert.ok(
-        '3.0.1' in second.versions,
-        'the background resolution should have verified it by now',
-      );
-      assert.equal(fetchCalls, 1);
+        const second = await plugin.filter_metadata(structuredClone(pkg));
+        assert.ok(
+          '3.0.1' in second.versions,
+          'the background resolution should have verified it by now',
+        );
+        assert.equal(fetchCalls, 1);
+      });
     },
   );
 
@@ -408,14 +470,16 @@ async function main() {
           },
         },
       );
-      plugin._storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
 
       const pkg = makePackageInfo('multi-ver-pkg', {
         '1.0.0': {version: '1.0.0', dist: {integrity: 'sha512-a'}},
         '2.0.0': {version: '2.0.0', dist: {integrity: 'sha512-b'}},
       });
-      await plugin.filter_metadata(pkg); // kicks off two background resolutions
-      await plugin.whenAllBackgroundWorkSettles();
+      await asOnlineRequest(async () => {
+        await plugin.filter_metadata(pkg); // kicks off two background resolutions
+        await plugin.whenAllBackgroundWorkSettles();
+      });
       // If these ran sequentially, the second fetch could only start after
       // the first's 'end' -- concurrent execution means both starts land
       // before either end.
@@ -435,7 +499,7 @@ async function main() {
         {block: ['**']}, // fetchUpstream omitted -- must default to false
         {fetch: makeFakeFetch({})}, // any call at all should throw
       );
-      plugin._storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
 
       const pkg = makePackageInfo('@actions/core', {
         '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
@@ -469,9 +533,11 @@ async function main() {
         {block: ['**'], fetchUpstream: true},
         {fetch: fakeFetch},
       );
-      podOne._storage = sharedStorage;
-      await podOne.filter_metadata(structuredClone(pkg));
-      await podOne.whenAllBackgroundWorkSettles();
+      podOne._storage = wrapAsTopLevelStorage(sharedStorage);
+      await asOnlineRequest(async () => {
+        await podOne.filter_metadata(structuredClone(pkg));
+        await podOne.whenAllBackgroundWorkSettles();
+      });
       assert.equal(fetchCalls, 1);
 
       // A brand new plugin instance -- fresh in-memory _verdictCache, same
@@ -480,17 +546,297 @@ async function main() {
         {block: ['**'], fetchUpstream: true},
         {fetch: fakeFetch},
       );
-      podTwo._storage = sharedStorage;
-      const afterRestart = await podTwo.filter_metadata(structuredClone(pkg));
+      podTwo._storage = wrapAsTopLevelStorage(sharedStorage);
+      const afterRestart = await asOnlineRequest(() =>
+        podTwo.filter_metadata(structuredClone(pkg)),
+      );
       assert.ok(
         '3.0.1' in afterRestart.versions,
-        'the persisted .good object must be found on the FIRST call after restart, synchronously',
+        'the persisted object must be found on the FIRST call after restart, synchronously',
       );
       assert.equal(
         fetchCalls,
         1,
         'must not re-fetch -- the fast tier (persisted storage) already had the answer',
       );
+    },
+  );
+
+  // --- offline-restriction matching, mirroring verdaccio-offline-enforcer's own _isRestricted() ---
+
+  function makeAttestationsWithOfflineConfig(
+    offlineEnforcerConfig,
+    config = {},
+  ) {
+    return new Attestations(config, {
+      logger: NOOP_LOGGER,
+      fetch: makeFakeFetch({}),
+      config: {
+        middlewares: {
+          '@fortmesa/verdaccio-offline-enforcer': offlineEnforcerConfig,
+        },
+      },
+    });
+  }
+
+  await check(
+    '_isOfflineRestricted: online wins even if the same identity is also listed offline elsewhere',
+    () => {
+      const plugin = makeAttestationsWithOfflineConfig({
+        online: ['ci-online-group'],
+        offline: [],
+      });
+      assert.equal(
+        plugin._isOfflineRestricted({
+          name: 'ci-bot',
+          real_groups: ['ci-online-group'],
+        }),
+        false,
+      );
+    },
+  );
+
+  await check(
+    '_isOfflineRestricted: an identity (by name or by group) listed offline is restricted',
+    () => {
+      const plugin = makeAttestationsWithOfflineConfig({
+        online: [],
+        offline: ['ci-offline-group'],
+      });
+      assert.equal(
+        plugin._isOfflineRestricted({
+          name: 'ci-bot',
+          real_groups: ['ci-offline-group'],
+        }),
+        true,
+      );
+      assert.equal(
+        plugin._isOfflineRestricted({
+          name: 'ci-offline-group',
+          real_groups: [],
+        }),
+        true,
+        'matching by name directly, not just via real_groups',
+      );
+    },
+  );
+
+  await check(
+    '_isOfflineRestricted: real_groups only -- the universal .groups superset must not be consulted',
+    () => {
+      const plugin = makeAttestationsWithOfflineConfig({
+        online: [],
+        offline: ['$authenticated'],
+      });
+      assert.equal(
+        plugin._isOfflineRestricted({
+          name: 'someone',
+          real_groups: ['some-team'],
+          groups: ['some-team', '$authenticated', '$all'],
+        }),
+        false,
+        '$authenticated is a universal default in .groups, not a real_groups entry -- must not match',
+      );
+    },
+  );
+
+  await check(
+    '_isOfflineRestricted defaults: enforceForAnonymous true, enforceForUnknown false',
+    () => {
+      const plugin = makeAttestationsWithOfflineConfig({
+        online: [],
+        offline: [],
+      });
+      assert.equal(
+        plugin._isOfflineRestricted(undefined),
+        true,
+        'anonymous (no remote_user at all) is restricted by default',
+      );
+      assert.equal(
+        plugin._isOfflineRestricted({name: 'nobody-listed', real_groups: []}),
+        false,
+        'an authenticated identity matching neither list is NOT restricted by default',
+      );
+    },
+  );
+
+  await check(
+    '_isOfflineRestricted: enforceForUnknown true flips the default for unlisted authenticated identities',
+    () => {
+      const plugin = makeAttestationsWithOfflineConfig({
+        online: [],
+        offline: [],
+        enforceForUnknown: true,
+      });
+      assert.equal(
+        plugin._isOfflineRestricted({name: 'nobody-listed', real_groups: []}),
+        true,
+      );
+    },
+  );
+
+  await check(
+    '_isOfflineRestricted: no offline-enforcer config at all -- empty lists plus its own documented defaults',
+    () => {
+      const plugin = makeAttestations({}); // no options.config.middlewares at all
+      assert.equal(plugin._isOfflineRestricted(undefined), true);
+      assert.equal(
+        plugin._isOfflineRestricted({name: 'anyone', real_groups: []}),
+        false,
+      );
+    },
+  );
+
+  // --- _effectiveFetchUpstream: the static config AND this request's identity ---
+
+  await check(
+    '_effectiveFetchUpstream: false when fetchUpstream config is false, regardless of request context',
+    async () => {
+      const plugin = makeAttestations({fetchUpstream: false});
+      await asOnlineRequest(() => {
+        assert.equal(plugin._effectiveFetchUpstream(), false);
+      });
+    },
+  );
+
+  await check(
+    '_effectiveFetchUpstream: false with no request context at all (e.g. a non-HTTP code path) -- fails closed',
+    () => {
+      const plugin = makeAttestations({fetchUpstream: true});
+      assert.equal(plugin._effectiveFetchUpstream(), false);
+    },
+  );
+
+  await check(
+    '_effectiveFetchUpstream: true only when fetchUpstream is enabled AND this request is not offline-restricted',
+    async () => {
+      const plugin = makeAttestations({fetchUpstream: true});
+      await requestContext.run({offlineRestricted: false}, () => {
+        assert.equal(plugin._effectiveFetchUpstream(), true);
+      });
+      await requestContext.run({offlineRestricted: true}, () => {
+        assert.equal(plugin._effectiveFetchUpstream(), false);
+      });
+    },
+  );
+
+  await check(
+    'end-to-end: an offline-restricted identity gets fetchUpstream forced off for its own request, an online one does not',
+    async () => {
+      let fetchCalls = 0;
+      let currentUser;
+      const plugin = new Attestations(
+        {block: ['**'], fetchUpstream: true},
+        {
+          logger: NOOP_LOGGER,
+          fetch: async () => {
+            fetchCalls += 1;
+            return {ok: true, json: async () => REAL_ATTESTATIONS};
+          },
+          config: {
+            middlewares: {
+              '@fortmesa/verdaccio-offline-enforcer': {offline: ['ci-bot']},
+            },
+          },
+        },
+      );
+
+      const app = express();
+      // Sets req.remote_user BEFORE register_middlewares' own ALS-populating
+      // middleware runs, same as a real auth plugin would -- registration
+      // order matters here, unlike the plugin's own internal middlewares.
+      app.use((req, res, next) => {
+        req.remote_user = currentUser;
+        next();
+      });
+      plugin.register_middlewares(
+        app,
+        {config: {}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      app.get('/:pkg', (req, res, next) => {
+        const pkg = makePackageInfo('@actions/core', {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        });
+        plugin
+          .filter_metadata(pkg)
+          .then(result => res.json(result))
+          .catch(next);
+      });
+
+      const server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      try {
+        const port = server.address().port;
+
+        // Restricted identity's request: filter_metadata's fast tier fails
+        // closed AND the background resolution it kicks off must never
+        // actually reach the network, even though fetchUpstream is true.
+        currentUser = {name: 'ci-bot', real_groups: []};
+        await fetch(`http://localhost:${port}/x`);
+        await plugin.whenAllBackgroundWorkSettles();
+        assert.equal(
+          fetchCalls,
+          0,
+          "an offline-restricted identity's request must never trigger a live upstream fetch",
+        );
+
+        // A DIFFERENT, non-restricted identity's request for the SAME
+        // package (a fresh plugin instance avoids the first identity's
+        // now-cached "not yet verified" verdict masking this).
+        const plugin2 = new Attestations(
+          {block: ['**'], fetchUpstream: true},
+          {
+            logger: NOOP_LOGGER,
+            fetch: async () => {
+              fetchCalls += 1;
+              return {ok: true, json: async () => REAL_ATTESTATIONS};
+            },
+            config: {
+              middlewares: {
+                '@fortmesa/verdaccio-offline-enforcer': {offline: ['ci-bot']},
+              },
+            },
+          },
+        );
+        const app2 = express();
+        app2.use((req, res, next) => {
+          req.remote_user = {name: 'a-developer', real_groups: []};
+          next();
+        });
+        plugin2.register_middlewares(
+          app2,
+          {config: {}},
+          wrapAsTopLevelStorage(makeFakeStorage()),
+        );
+        app2.get('/:pkg', (req, res, next) => {
+          const pkg = makePackageInfo('@actions/core', {
+            '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+          });
+          plugin2
+            .filter_metadata(pkg)
+            .then(result => res.json(result))
+            .catch(next);
+        });
+        const server2 = await new Promise(resolve => {
+          const s = app2.listen(0, () => resolve(s));
+        });
+        try {
+          const port2 = server2.address().port;
+          await fetch(`http://localhost:${port2}/x`);
+          await plugin2.whenAllBackgroundWorkSettles();
+          assert.equal(
+            fetchCalls,
+            1,
+            "a non-restricted identity's request must be able to trigger the live upstream fetch",
+          );
+        } finally {
+          server2.close();
+        }
+      } finally {
+        server.close();
+      }
     },
   );
 
@@ -519,7 +865,7 @@ async function main() {
     'a publish with no .sigstore attachment is left untouched',
     async () => {
       const plugin = makeAttestations({});
-      plugin._storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
       const body = {
         name: 'plain-pkg',
         versions: {'1.0.0': {version: '1.0.0', dist: {}}},
@@ -532,11 +878,11 @@ async function main() {
   );
 
   await check(
-    'a publish with a valid .sigstore attachment gets verified, stored as a single .good object, and stripped to one attachment',
+    'a publish with a valid .sigstore attachment gets verified, stored as a single verdict object, and stripped to one attachment',
     async () => {
       const plugin = makeAttestations({});
       const storage = makeFakeStorage();
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
 
       const bundle = realProvenanceBundle();
       const body = {
@@ -553,7 +899,7 @@ async function main() {
       };
 
       const res = makeFakeRes(201);
-      await plugin._interceptPublish({body}, res, '@actions/core');
+      await plugin._interceptPublish(makeFakeReq(body), res, '@actions/core');
 
       assert.equal(
         Object.keys(body._attachments).length,
@@ -570,17 +916,21 @@ async function main() {
       );
 
       assert.ok(
-        !storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+        !storage.files.has('@actions/core\x00@actions-core-3.0.1.attestation'),
         'must not be stored yet -- only once the response actually finishes',
       );
 
       res._triggerFinish();
       await plugin.whenAllBackgroundWorkSettles();
 
-      assert.ok(
-        storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
-        'a single .good object (verdict encoded in the extension) must hold the bundle -- no separate marker file',
+      const stored = storage.files.get(
+        '@actions/core\x00@actions-core-3.0.1.attestation',
       );
+      assert.ok(
+        stored,
+        'a single object (verdict is a field in its contents) must hold the bundle -- no separate marker file',
+      );
+      assert.equal(JSON.parse(stored.toString('utf8')).verified, true);
       assert.ok(
         !storage.files.has('@actions/core\x00@actions-core-3.0.1.sigstore'),
       );
@@ -614,7 +964,7 @@ async function main() {
         }
         return realAddTarball(name, filename);
       };
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
 
       const bundle = realProvenanceBundle();
       const body = {
@@ -630,7 +980,7 @@ async function main() {
         },
       };
       const res = makeFakeRes(201);
-      await plugin._interceptPublish({body}, res, '@actions/core');
+      await plugin._interceptPublish(makeFakeReq(body), res, '@actions/core');
 
       // Verdaccio's own core publish handler (downstream of this
       // middleware, reached via next()) is what actually creates the
@@ -640,7 +990,7 @@ async function main() {
       await plugin.whenAllBackgroundWorkSettles();
 
       assert.ok(
-        storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+        storage.files.has('@actions/core\x00@actions-core-3.0.1.attestation'),
         'must succeed once retried after the package actually exists',
       );
     },
@@ -651,7 +1001,7 @@ async function main() {
     async () => {
       const plugin = makeAttestations({});
       const storage = makeFakeStorage();
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
 
       const bundle = realProvenanceBundle();
       const body = {
@@ -668,12 +1018,12 @@ async function main() {
       };
       // e.g. security-filter's own publish gate rejected it downstream.
       const res = makeFakeRes(403);
-      await plugin._interceptPublish({body}, res, '@actions/core');
+      await plugin._interceptPublish(makeFakeReq(body), res, '@actions/core');
       res._triggerFinish();
       await plugin.whenAllBackgroundWorkSettles();
 
       assert.ok(
-        !storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+        !storage.files.has('@actions/core\x00@actions-core-3.0.1.attestation'),
         'a rejected publish must never leave an orphaned verdict object in storage',
       );
     },
@@ -684,7 +1034,7 @@ async function main() {
     async () => {
       const plugin = makeAttestations({});
       const storage = makeFakeStorage();
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
 
       const tamperedBundle = realProvenanceBundle();
       const body = {
@@ -706,7 +1056,7 @@ async function main() {
       };
 
       const res = makeFakeRes(201);
-      await plugin._interceptPublish({body}, res, '@actions/core');
+      await plugin._interceptPublish(makeFakeReq(body), res, '@actions/core');
       res._triggerFinish();
       await plugin.whenAllBackgroundWorkSettles();
 
@@ -716,21 +1066,27 @@ async function main() {
         body.versions['3.0.1'].dist.attestations.reason,
         /digest does not match/,
       );
-      assert.ok(storage.files.has('@actions/core\x00@actions-core-3.0.1.bad'));
-      assert.ok(
-        !storage.files.has('@actions/core\x00@actions-core-3.0.1.good'),
+      const stored = storage.files.get(
+        '@actions/core\x00@actions-core-3.0.1.attestation',
       );
+      assert.ok(
+        stored,
+        'a failed verdict is still stored -- the bundle was present and evaluated, just did not verify',
+      );
+      const parsed = JSON.parse(stored.toString('utf8'));
+      assert.equal(parsed.verified, false);
+      assert.match(parsed.reason, /digest does not match/);
     },
   );
 
   // --- GET /-/npm/v1/attestations/:pkgAtVersion ---
 
   await check(
-    'serves an already-locally-stored (.good) bundle without any upstream fetch',
+    'serves an already-locally-stored verified bundle without any upstream fetch',
     async () => {
       const plugin = makeAttestations({}, {fetch: makeFakeFetch({})});
       const storage = makeFakeStorage();
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
       await plugin._storeVerdictAndBundle(
         '@actions/core',
         '3.0.1',
@@ -764,7 +1120,7 @@ async function main() {
     'with fetchUpstream disabled (default), a genuine miss 404s without attempting a fetch',
     async () => {
       const plugin = makeAttestations({}, {fetch: makeFakeFetch({})}); // any call should throw
-      plugin._storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
 
       let statusCode;
       const res = {
@@ -799,7 +1155,7 @@ async function main() {
         },
       );
       const storage = makeFakeStorage();
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
 
       let statusCode;
       let jsonBody;
@@ -814,9 +1170,11 @@ async function main() {
         },
         end() {},
       };
-      await plugin._handleGetAttestations(
-        {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
-        res,
+      await asOnlineRequest(() =>
+        plugin._handleGetAttestations(
+          {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
+          res,
+        ),
       );
       assert.equal(statusCode, 200);
       assert.equal(fetchCalls, 1);
@@ -833,7 +1191,7 @@ async function main() {
     '404s when neither local storage nor (disabled) upstream has anything',
     async () => {
       const plugin = makeAttestations({}, {fetch: makeFakeFetch({})});
-      plugin._storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
 
       let statusCode;
       const res = {
@@ -862,7 +1220,11 @@ async function main() {
       const plugin = makeAttestations({});
       const storage = makeFakeStorage();
       const app = express();
-      plugin.register_middlewares(app, {config: {}}, storage);
+      plugin.register_middlewares(
+        app,
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
       // Simulates Verdaccio's own core publish route, mounted after this
       // plugin's middleware -- proves the modified body actually reaches
       // downstream handlers correctly, not just that our own method works
@@ -921,7 +1283,7 @@ async function main() {
     async () => {
       const plugin = makeAttestations({});
       const storage = makeFakeStorage();
-      plugin._storage = storage;
+      plugin._storage = wrapAsTopLevelStorage(storage);
       await plugin._storeVerdictAndBundle(
         '@actions/core',
         '3.0.1',
@@ -930,7 +1292,11 @@ async function main() {
       );
 
       const app = express();
-      plugin.register_middlewares(app, {config: {}}, storage);
+      plugin.register_middlewares(
+        app,
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
 
       const server = await new Promise(resolve => {
         const s = app.listen(0, () => resolve(s));
@@ -946,6 +1312,186 @@ async function main() {
       } finally {
         server.close();
       }
+    },
+  );
+
+  // --- DELETE /:pkg/-/:filename/-rev/:revision -- verdict follows its tarball's lifecycle ---
+
+  await check(
+    'end-to-end: deleting a real tarball also removes its stored verdict',
+    async () => {
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(storage);
+      await plugin._storeVerdictAndBundle(
+        '@actions/core',
+        '3.0.1',
+        realProvenanceBundle(),
+        {verified: true},
+      );
+      assert.ok(
+        storage.files.has('@actions/core\x00@actions-core-3.0.1.attestation'),
+        'sanity check: the verdict is actually there before the delete',
+      );
+
+      const app = express();
+      plugin.register_middlewares(
+        app,
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+      app.delete('/:package/-/:filename/-rev/:revision', (req, res) => {
+        res.status(200).json({ok: true});
+      });
+
+      const server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      try {
+        const port = server.address().port;
+        const response = await fetch(
+          `http://localhost:${port}/${encodeURIComponent('@actions/core')}/-/core-3.0.1.tgz/-rev/1`,
+          {method: 'DELETE'},
+        );
+        assert.equal(response.status, 200);
+        // The cleanup itself is deferred to res.on('finish'), same as
+        // publish -- give it a tick to actually run.
+        await new Promise(r => setTimeout(r, 50));
+        assert.ok(
+          !storage.files.has(
+            '@actions/core\x00@actions-core-3.0.1.attestation',
+          ),
+          'the verdict must be removed along with its tarball',
+        );
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'end-to-end: deleting a tarball with no stored verdict at all is a harmless no-op',
+    async () => {
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+
+      const app = express();
+      plugin.register_middlewares(
+        app,
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+      app.delete('/:package/-/:filename/-rev/:revision', (req, res) => {
+        res.status(200).json({ok: true});
+      });
+
+      const server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      try {
+        const port = server.address().port;
+        const response = await fetch(
+          `http://localhost:${port}/never-verified-pkg/-/never-verified-pkg-1.0.0.tgz/-rev/1`,
+          {method: 'DELETE'},
+        );
+        assert.equal(
+          response.status,
+          200,
+          'the delete itself must still succeed',
+        );
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  await check(
+    'end-to-end: a rejected tarball delete (non-2xx) never triggers verdict cleanup',
+    async () => {
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(storage);
+      await plugin._storeVerdictAndBundle(
+        '@actions/core',
+        '3.0.1',
+        realProvenanceBundle(),
+        {verified: true},
+      );
+
+      const app = express();
+      plugin.register_middlewares(
+        app,
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+      app.delete('/:package/-/:filename/-rev/:revision', (req, res) => {
+        res.status(403).json({error: 'forbidden'});
+      });
+
+      const server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      try {
+        const port = server.address().port;
+        await fetch(
+          `http://localhost:${port}/${encodeURIComponent('@actions/core')}/-/core-3.0.1.tgz/-rev/1`,
+          {method: 'DELETE'},
+        );
+        await new Promise(r => setTimeout(r, 50));
+        assert.ok(
+          storage.files.has('@actions/core\x00@actions-core-3.0.1.attestation'),
+          'a rejected delete must leave the verdict (and the real tarball it belongs to) untouched',
+        );
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  // --- in-memory-only fallback: no storage.localStorage reachable at all ---
+
+  await check(
+    'with no persistent storage at all, verification still works via the in-memory cache alone (no crash, no persist attempt)',
+    async () => {
+      // sharedStorage is module-level (see index.js) and persists across
+      // every test in this process -- earlier tests in this same file have
+      // already called register_middlewares(), so without resetting it
+      // here, _getLocalStorage() would find THEIR leftover storage instead
+      // of genuinely exercising "nothing reachable at all".
+      __resetSharedStateForTests();
+
+      let fetchCalls = 0;
+      const plugin = makeAttestations(
+        {block: ['**'], fetchUpstream: true},
+        {
+          fetch: async () => {
+            fetchCalls += 1;
+            return {ok: true, json: async () => REAL_ATTESTATIONS};
+          },
+        },
+      );
+      // Deliberately never sets plugin._storage at all -- _getLocalStorage()
+      // must return null, and every storage-touching path must degrade to
+      // in-memory-only rather than throw. Must stay @actions/core@3.0.1 --
+      // the real attestation's subject is bound to that exact name/version,
+      // so verification would genuinely (correctly) fail against any other
+      // package name, defeating the point of this test.
+      const pkg = makePackageInfo('@actions/core', {
+        '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+      });
+
+      await asOnlineRequest(async () => {
+        const first = await plugin.filter_metadata(structuredClone(pkg));
+        assert.ok(!('3.0.1' in first.versions));
+        await plugin.whenAllBackgroundWorkSettles();
+
+        const second = await plugin.filter_metadata(structuredClone(pkg));
+        assert.ok(
+          '3.0.1' in second.versions,
+          'the in-memory _verdictCache alone must be enough to answer the second check',
+        );
+        assert.equal(fetchCalls, 1, 'must not have crashed or re-fetched');
+      });
     },
   );
 

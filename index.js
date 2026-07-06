@@ -17,6 +17,7 @@ const semver = require('semver');
 const {minimatch} = require('minimatch');
 const nodeFetch = require('node-fetch');
 const https = require('node:https');
+const {AsyncLocalStorage} = require('node:async_hooks');
 const {HttpsProxyAgent} = require('https-proxy-agent');
 const {verifyBundle, verifyAttestationsResponse} = require('./verify');
 
@@ -26,8 +27,46 @@ const {verifyBundle, verifyAttestationsResponse} = require('./verify');
 // verdaccio-security-filter's PLUGIN_CONFIG_KEY already establishes).
 const PLUGIN_CONFIG_KEY = '@fortmesa/verdaccio-attestations';
 
+// Sibling plugin whose online/offline policy this plugin's fetchUpstream
+// gating must respect -- see the constructor and _isOfflineRestricted()
+// below. Deliberately read directly by config key rather than through any
+// runtime signal from that plugin (see the AsyncLocalStorage comment below
+// for why a request-time signal doesn't work here); the two plugins are
+// maintained together, so a config-shape change on one side implies
+// touching this one too.
+const OFFLINE_ENFORCER_CONFIG_KEY = '@fortmesa/verdaccio-offline-enforcer';
+
 const ATTESTATIONS_PATH_PREFIX = '/-/npm/v1/attestations/';
 const REAL_NPM_REGISTRY = 'https://registry.npmjs.org';
+
+// Carries the current request's offline-restriction decision from
+// register_middlewares() (real req access) down into filter_metadata() and
+// _handleGetAttestations() (neither has req access -- filter_metadata's
+// signature is fixed by Verdaccio's own plugin-utils.d.ts as
+// (manifest) => Promise<manifest>, no request context at all). Confirmed
+// empirically against a real running Verdaccio process, including under
+// concurrent requests, that a context set here survives Verdaccio's entire
+// internal getPackage() -> _syncUplinksMetadata() -> _applyFilters() call
+// chain with correct per-request isolation (no cross-request leakage).
+// Module-level like sharedStorage/sharedAuth below -- not tied to either
+// plugin-instance role, so it works the same regardless of which instance
+// (filter or middleware) ends up running a given piece of code.
+const requestContext = new AsyncLocalStorage();
+
+// Bridges register_middlewares()'s storage/auth handles across to the
+// SEPARATE filter-role instance (see the constructor comment on
+// PLUGIN_CONFIG_KEY lookup below) -- both instances live in the same
+// process/module, so a module-level slot is the only thing they share.
+// Without this, any verdict resolved via filter_metadata()'s background
+// path (real fetchUpstream verification, not a same-request local publish)
+// crashes trying to persist on an instance that never received storage --
+// caught and logged, but silently defeating the entire point of persisting
+// a verdict at all: every such package re-verifies from scratch on every
+// process/replica that hasn't itself already resolved it in memory.
+// Assumes one Verdaccio process hosts one logical configuration of this
+// plugin, same assumption the shared filters:-config lookup already makes.
+let sharedStorage;
+let sharedAuth;
 
 // Same matching convention Verdaccio's own packages: access-control config
 // uses (@verdaccio/utils's getMatchedPackagesSpec: real minimatch globs,
@@ -107,13 +146,30 @@ function splitPkgAtVersion(pkgAtVersion) {
   return {name: pkgAtVersion.slice(0, at), version: pkgAtVersion.slice(at + 1)};
 }
 
-// One base name per package@version, alongside the tarball in the same
-// per-package storage location. Exactly one object is ever stored under
-// it -- <base>.good or <base>.bad, never both, and never a separate
-// .sigstore file -- see _readStoredVerdict()/_storeVerdictAndBundle() for
-// why: the verdict lives in the extension itself, not a second object.
-function attestationBaseFilename(name, version) {
-  return `${name.replace('/', '-')}-${version}`;
+// One file per package@version, alongside the tarball in the same
+// per-package storage location -- never a separate .sigstore file, see
+// _readStoredVerdict()/_storeVerdictAndBundle() for why: the verdict and
+// its bundle live in one object's contents ({verified, bundle, reason}),
+// not encoded in the filename. A single lookup either hits or misses --
+// no second attempt needed to tell "known bad" apart from "never checked".
+function attestationFilename(name, version) {
+  return `${name.replace('/', '-')}-${version}.attestation`;
+}
+
+// Given a real tarball's own filename (e.g. "core-3.0.1.tgz" for
+// "@actions/core" -- real npm strips the scope from the tarball name,
+// confirmed against a real registry.npmjs.org response) and the ALREADY-
+// KNOWN package name it belongs to, recovers the version. Unambiguous
+// specifically because the package name is already known, not guessed --
+// this only strips a known prefix/suffix, it never tries to split an
+// arbitrary "name-version" string on its own.
+function deriveVersionFromTarballFilename(packageName, filename) {
+  const unscopedName = packageName.includes('/')
+    ? packageName.slice(packageName.indexOf('/') + 1)
+    : packageName;
+  const prefix = `${unscopedName}-`;
+  if (!filename.startsWith(prefix) || !filename.endsWith('.tgz')) return null;
+  return filename.slice(prefix.length, -'.tgz'.length);
 }
 
 // Nearest older non-blocked version, falling back to nearest newer, then
@@ -144,19 +200,38 @@ class Attestations {
       sharedConfig.strict_ssl !== undefined ? sharedConfig.strict_ssl : true;
 
     // Default false: this plugin never talks to the real npm registry
-    // unless explicitly opted into. verdaccio-offline-enforcer's
-    // online/offline policy governs Verdaccio's own uplink fetches, but has
-    // no visibility into this plugin's own direct HTTP calls -- defaulting
-    // to "never fetch" is the only way this plugin can't quietly bypass
-    // whatever policy governs a given deployment's traffic. When false, a
-    // proxied package with no locally-stored verdict is simply treated as
-    // unverifiable (blocked, if a block: rule covers it) rather than
-    // reaching out.
+    // unless explicitly opted into. When false, a proxied package with no
+    // locally-stored verdict is simply treated as unverifiable (blocked, if
+    // a block: rule covers it) rather than reaching out. This is the
+    // static, whole-deployment default -- see _isOfflineRestricted() below
+    // for the additional PER-REQUEST override that can force this off for
+    // one specific identity even when the static config says true.
     this.fetchUpstream = sharedConfig.fetchUpstream ?? false;
+
+    // verdaccio-offline-enforcer's own online/offline policy, read
+    // directly from its config section rather than from any runtime signal
+    // it produces -- see the requestContext/AsyncLocalStorage comment
+    // above for why a request-time signal from that plugin doesn't work
+    // (its own gating can swallow a request via its internal
+    // storage.getPackage() call without ever reaching a shared middleware
+    // ordering point both plugins could rely on). Mirrors
+    // OfflineEnforcer's own _isRestricted() field-for-field, including its
+    // exact defaults -- these two plugins are maintained together, so a
+    // rename on that side (already happened once: onlineUsernames/
+    // offlineUsernames -> online/offline) is expected to come with an
+    // update here too, not defended against.
+    const offlineEnforcerConfig =
+      options.config?.middlewares?.[OFFLINE_ENFORCER_CONFIG_KEY];
+    this._offlineOnline = new Set(offlineEnforcerConfig?.online ?? []);
+    this._offlineOffline = new Set(offlineEnforcerConfig?.offline ?? []);
+    this._offlineEnforceForAnonymous =
+      offlineEnforcerConfig?.enforceForAnonymous ?? true;
+    this._offlineEnforceForUnknown =
+      offlineEnforcerConfig?.enforceForUnknown ?? false;
 
     // "name@version" -> {verified, reason, predicateType}. Populated once
     // per pod lifetime -- backed by _readStoredVerdict()'s persisted
-    // .good/.bad object for anything that survives a restart.
+    // object for anything that survives a restart.
     this._verdictCache = options.verdictCache ?? new Map();
 
     this._parseJsonBody = bodyParser.json({
@@ -366,13 +441,15 @@ class Attestations {
       return result;
     }
 
-    if (!this.fetchUpstream) {
-      // Also deliberately not persisted -- fetchUpstream might get turned
-      // on later, and this shouldn't calcify into a permanent .bad record.
+    if (!this._effectiveFetchUpstream()) {
+      // Also deliberately not persisted -- this may only reflect this one
+      // request's identity being offline-restricted, or fetchUpstream might
+      // get turned on later either way -- this shouldn't calcify into a
+      // permanent bad record.
       const result = {
         verified: false,
         reason:
-          'fetchUpstream is disabled -- cannot verify a proxied package without contacting the real registry',
+          'fetchUpstream is disabled (or this request is offline-restricted) -- cannot verify a proxied package without contacting the real registry',
       };
       this._verdictCache.set(key, result);
       return result;
@@ -404,39 +481,104 @@ class Attestations {
     return result;
   }
 
-  // Exactly one stored object per package@version, not two -- the verdict
-  // lives in the FILENAME's own extension (.good/.bad), not a separate
-  // marker file. Object-storage backends (this repo's S3 usage included)
-  // typically bill per object with a real minimum regardless of content
-  // size, so a second tiny file per version would be a genuine cost at
-  // this data's scale; this reuses the one artifact already being stored
-  // anyway. Deliberately built only on the generic addTarball/getTarball
-  // interface every storage backend (S3, filesystem, or otherwise)
-  // implements -- no S3-specific object metadata/tags, so this works
-  // identically regardless of which backend is configured.
+  // Exactly one stored object per package@version -- the verdict is a field
+  // in the object's own contents, not encoded in the filename. One lookup
+  // either hits or misses; no second attempt needed to tell "known bad"
+  // apart from "never checked". Deliberately built only on the generic
+  // addTarball/getTarball interface every storage backend (S3, filesystem,
+  // or otherwise) implements via storage.localStorage -- no S3-specific
+  // object metadata/tags, so this works identically regardless of which
+  // backend is configured, and null when no persistent storage is reachable
+  // at all (see _getLocalStorage()) is treated the same as "never checked".
   async _readStoredVerdict(name, version) {
-    const base = attestationBaseFilename(name, version);
+    if (!this._getLocalStorage()) return null;
     try {
-      const {bundle} = await this._readBundle(name, `${base}.good`);
-      return {verified: true, bundle};
+      const {verified, bundle, reason} = await this._readBundle(
+        name,
+        attestationFilename(name, version),
+      );
+      return {verified, bundle, reason};
     } catch {
-      // no .good object -- fall through and try .bad
-    }
-    try {
-      const {bundle, reason} = await this._readBundle(name, `${base}.bad`);
-      return {verified: false, bundle, reason};
-    } catch {
-      return null; // neither exists -- never resolved yet
+      return null; // no object yet, or no persistent storage -- never resolved
     }
   }
 
   _storeVerdictAndBundle(name, version, bundle, result) {
-    const base = attestationBaseFilename(name, version);
-    const filename = `${base}.${result.verified ? 'good' : 'bad'}`;
+    if (!this._getLocalStorage()) return Promise.resolve(); // in-memory-only fallback -- nothing to persist to
     const content = result.verified
-      ? {bundle}
-      : {bundle, reason: result.reason};
-    return this._storeBundle(name, filename, content);
+      ? {verified: true, bundle}
+      : {verified: false, bundle, reason: result.reason};
+    return this._storeBundle(name, attestationFilename(name, version), content);
+  }
+
+  // Falls back to the module-level shared handle when this instance is the
+  // filter-role one (never received its own via register_middlewares) --
+  // see the comment on sharedStorage/sharedAuth above.
+  _getAuth() {
+    return this._auth ?? sharedAuth;
+  }
+
+  // The `storage` register_middlewares() receives is Verdaccio core's
+  // top-level orchestrating Storage class -- ITS OWN addTarball/getTarball
+  // must never be used for verdict persistence: getTarball(), on any miss,
+  // automatically falls back to "sync metadata from the uplink", which
+  // re-invokes every registered filter's filter_metadata() (ours included)
+  // -- and _readStoredVerdict()'s very first check for a never-before-seen
+  // package@version is *guaranteed* to miss, so this recurses into itself
+  // forever. Confirmed by hanging a real Verdaccio process this way, for a
+  // purely local package with zero uplinks configured too -- not proxy-
+  // specific, this is inherent to calling Storage.getTarball() from inside
+  // filter_metadata() at all.
+  //
+  // storage.localStorage is a different, lower-level class (local-storage.js)
+  // that Storage wraps -- a plain, non-private property (confirmed:
+  // `this.localStorage = ...` in Storage's own constructor), whose own
+  // addTarball/getTarball/removeTarball are thin wrappers directly over the
+  // configured storage plugin (filesystem or S3) with no uplink fallback
+  // and no filter re-check at all. Present under that exact name since
+  // Verdaccio 2.3.0 (2017), unchanged through the 3.0 TypeScript rewrite
+  // and the 5->6 jump -- stable, though not part of Verdaccio's documented
+  // plugin API, so this could in principle move in some future major
+  // version.
+  //
+  // Returns null (not undefined) when no persistent storage is reachable
+  // at all -- this instance never received one via register_middlewares
+  // AND no other instance in this process has either, or the one that did
+  // has no .localStorage yet -- callers treat that as "go in-memory-only",
+  // not as an error.
+  _getLocalStorage() {
+    const storage = this._storage ?? sharedStorage;
+    return storage?.localStorage ?? null;
+  }
+
+  // Mirrors OfflineEnforcer's own _isRestricted() field-for-field (see the
+  // constructor comment on _offlineOnline/_offlineOffline for why this is
+  // duplicated code reading shared config values, not a shared function) --
+  // online wins over offline if both somehow match, then enforceForUnknown
+  // decides anyone matching neither. real_groups specifically (not
+  // .groups): Verdaccio's createRemoteUser() puts a user's plugin-provided
+  // groups there, distinct from the universal $all/$authenticated-style
+  // defaults every logged-in user also gets, which would make every
+  // authenticated user match some default group otherwise.
+  _isOfflineRestricted(remoteUser) {
+    if (remoteUser?.name === undefined) return this._offlineEnforceForAnonymous;
+    const identities = [remoteUser.name, ...(remoteUser.real_groups ?? [])];
+    if (identities.some(id => this._offlineOnline.has(id))) return false;
+    if (identities.some(id => this._offlineOffline.has(id))) return true;
+    return this._offlineEnforceForUnknown;
+  }
+
+  // The actual per-request answer to "is a live upstream fetch allowed
+  // right now" -- the static fetchUpstream config AND this specific
+  // request's identity not being offline-restricted. Fails closed (no
+  // fetch) when there's no request context at all -- reachable only from
+  // non-HTTP code paths (e.g. Verdaccio's own web-UI package listing),
+  // where there's no identity to evaluate in the first place.
+  _effectiveFetchUpstream() {
+    if (!this.fetchUpstream) return false;
+    const ctx = requestContext.getStore();
+    if (!ctx) return false;
+    return !ctx.offlineRestricted;
   }
 
   // Mirrors verdaccio-audit's ProxyAudit exactly: a plain HTTPS agent by
@@ -445,8 +587,9 @@ class Attestations {
   // plugin behaves the same way in a firewalled/corporate deployment that
   // routes all outbound npmjs traffic through a specific proxy.
   _requestAgent() {
-    if (this._auth?.config?.https_proxy) {
-      return new HttpsProxyAgent(this._auth.config.https_proxy);
+    const auth = this._getAuth();
+    if (auth?.config?.https_proxy) {
+      return new HttpsProxyAgent(auth.config.https_proxy);
     }
     return new https.Agent({rejectUnauthorized: this.strictSsl});
   }
@@ -471,6 +614,23 @@ class Attestations {
   register_middlewares(app, auth, storage) {
     this._storage = storage;
     this._auth = auth;
+    sharedStorage = storage;
+    sharedAuth = auth;
+
+    // Unconditional and first: establishes this request's offline-
+    // restriction context before anything else in this plugin (or
+    // Verdaccio's own downstream handling, which is what eventually calls
+    // filter_metadata()) runs. See the requestContext/AsyncLocalStorage
+    // comment above -- this is what makes that context visible from
+    // filter_metadata() and _handleGetAttestations() further down the
+    // chain, verified empirically to survive Verdaccio's internal
+    // getPackage() -> _syncUplinksMetadata() -> _applyFilters() chain.
+    app.use((req, res, next) => {
+      requestContext.run(
+        {offlineRestricted: this._isOfflineRestricted(req.remote_user)},
+        () => next(),
+      );
+    });
 
     app.use((req, res, next) => {
       if (req.method !== 'PUT') return next();
@@ -490,6 +650,66 @@ class Attestations {
         if (err) return next(err);
         this._interceptPublish(req, res, packageName).finally(() => next());
       });
+    });
+
+    // Mirrors the real tarball's own lifecycle -- Verdaccio's dedicated
+    // single-tarball delete route (DELETE /:package/-/:filename/-rev/:revision,
+    // -> storage.removeTarball()) is the one real gap in "this plugin's own
+    // stored verdict tracks its tarball's lifecycle": full package removal
+    // already cleans up every _attachments entry (ours included) via
+    // Verdaccio's own removePackage(), for free, but nothing previously
+    // caught a single tarball being deleted this way. Deliberately does NOT
+    // add cleanup for single-version unpublish (PUT with fewer versions,
+    // Verdaccio's own changePackage()) -- that path doesn't delete the real
+    // tarball either, only clears a bookkeeping field, and this plugin's
+    // stated principle is to match Verdaccio's own tarball lifecycle, not
+    // exceed it.
+    app.use((req, res, next) => {
+      if (req.method !== 'DELETE') return next();
+      const segments = req.path
+        .replace(/\/%40/, '/@')
+        .split('/')
+        .filter(Boolean);
+      if (
+        segments.length !== 5 ||
+        segments[1] !== '-' ||
+        segments[3] !== '-rev'
+      )
+        return next();
+      const packageName = decodeURIComponent(segments[0]);
+      const filename = decodeURIComponent(segments[2]);
+      const version = deriveVersionFromTarballFilename(packageName, filename);
+      if (!version) return next();
+
+      // Best-effort, deferred until the real delete actually succeeds --
+      // same res.on('finish')/statusCode guard _interceptPublish already
+      // uses, so a rejected delete (e.g. permission denied) never triggers
+      // cleanup for a tarball that's still actually there.
+      res.on('finish', () => {
+        if (res.statusCode >= 300) return;
+        const localStorage = this._getLocalStorage();
+        if (!localStorage) return;
+        localStorage.removeTarball(
+          packageName,
+          attestationFilename(packageName, version),
+          undefined, // revision -- Verdaccio's own removeTarball never reads this param either
+          err => {
+            // A 404 here just means this version was never verified (no
+            // stored verdict to clean up) -- not a real failure. Checking
+            // the numeric status (Verdaccio's own getNotFound() sets
+            // err.code to the HTTP status, not a string like 'ENOENT')
+            // rather than matching its message text, which isn't a stable
+            // contract across Verdaccio versions.
+            if (err && err.code !== 404) {
+              this.logger.warn(
+                {pkg: packageName, ver: version, err: err.message},
+                'verdaccio-attestations: failed to remove stored verdict for a deleted tarball',
+              );
+            }
+          },
+        );
+      });
+      next();
     });
 
     app.get(`${ATTESTATIONS_PATH_PREFIX}:pkgAtVersion`, (req, res) => {
@@ -592,7 +812,18 @@ class Attestations {
 
     versionMeta.dist = versionMeta.dist ?? {};
     versionMeta.dist.attestations = {
-      url: `${ATTESTATIONS_PATH_PREFIX}${encodeURIComponent(packageName)}@${version}`,
+      // MUST be absolute -- confirmed directly against real npmjs.org's own
+      // packument (dist.attestations.url is a full https://registry.npmjs.org/...
+      // URL, never a bare path) and against a real crash this caused: a
+      // relative path here makes `npm audit signatures` (npm 10+, which also
+      // verifies provenance attestations, not just registry signatures)
+      // throw `TypeError: Invalid URL` inside pacote's RegistryFetcher --
+      // it constructs `new URL(dist.attestations.url)` with no base, which
+      // only works for an absolute URL. req.protocol/req.get('host') reflect
+      // what the client actually connected to (respecting Verdaccio's own
+      // server.trustProxy setting behind a proxy/ALB), matching how
+      // Verdaccio's own dist.tarball URLs are already built.
+      url: `${req.protocol}://${req.get('host')}${ATTESTATIONS_PATH_PREFIX}${encodeURIComponent(packageName)}@${version}`,
       verified: result.verified,
       reason: result.reason,
       predicateType: result.predicateType,
@@ -614,8 +845,11 @@ class Attestations {
   }
 
   _storeRaw(packageName, filename, buffer) {
+    const localStorage = this._getLocalStorage();
+    if (!localStorage)
+      return Promise.reject(new Error('no persistent storage available'));
     return new Promise((resolve, reject) => {
-      const stream = this._storage.addTarball(packageName, filename);
+      const stream = localStorage.addTarball(packageName, filename);
       stream.on('error', reject);
       stream.on('success', resolve);
       stream.end(buffer);
@@ -624,8 +858,11 @@ class Attestations {
   }
 
   _readRaw(packageName, filename) {
+    const localStorage = this._getLocalStorage();
+    if (!localStorage)
+      return Promise.reject(new Error('no persistent storage available'));
     return new Promise((resolve, reject) => {
-      const stream = this._storage.getTarball(packageName, filename);
+      const stream = localStorage.getTarball(packageName, filename);
       const chunks = [];
       stream.on('error', reject);
       stream.on('data', c => chunks.push(c));
@@ -671,7 +908,7 @@ class Attestations {
     if (stored?.bundle)
       return res.status(200).json({attestations: [{bundle: stored.bundle}]});
 
-    if (!this.fetchUpstream) return res.status(404).end();
+    if (!this._effectiveFetchUpstream()) return res.status(404).end();
     const fetched = await this._fetchFromUpstream(name, version);
     if (!fetched) return res.status(404).end();
     return res.status(200).json(fetched);
@@ -680,3 +917,17 @@ class Attestations {
 
 module.exports = (config, options) => new Attestations(config, options);
 module.exports.Attestations = Attestations;
+// Test-only: lets a unit test simulate "a real request came in" (via
+// requestContext.run({offlineRestricted}, fn)) around a direct method call
+// that doesn't go through register_middlewares' own Express middleware --
+// real request handling never imports this.
+module.exports.requestContext = requestContext;
+// Test-only: sharedStorage/sharedAuth are module-level (see the comment on
+// their declaration) so they persist across every test in the same process
+// -- a test that specifically wants to exercise "no persistent storage
+// reachable at all" needs a way to guarantee that, not just hope no earlier
+// test in the same run already called register_middlewares().
+module.exports.__resetSharedStateForTests = () => {
+  sharedStorage = undefined;
+  sharedAuth = undefined;
+};

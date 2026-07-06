@@ -49,10 +49,12 @@ closed immediately and resolved for real in the background, so one slow
 verification never delays every other version's read.
 
 See [`docs/configuration.md`](docs/configuration.md) for the full reference:
-`block`/`allow` matching and `strategy: replace`, the `fetchUpstream` flag and
-why it defaults to `false`, the single-object `.good`/`.bad` verdict storage
-design (and why), the fast-tier/background-verification architecture, proxy
-support, and the publish-time interception mechanics.
+`block`/`allow` matching and `strategy: replace`, the `fetchUpstream` flag
+(including its per-request override via `verdaccio-offline-enforcer`'s
+online/offline identity policy) and why it defaults to `false`, the
+single-object verdict storage design (and why), the fast-tier/background-
+verification architecture, proxy support, and the publish/delete-time
+interception mechanics.
 
 ## Installation
 
@@ -96,9 +98,13 @@ Runs a single hand-rolled `node:assert`-based smoke test file (no test
 framework/build step) covering `verify.js`'s cryptographic verification (against
 a real, captured `@actions/core@3.0.1` attestation fixture), `block`/`allow`
 matching and substitution, the fast-tier/background verification split,
-`fetchUpstream` gating, proxy agent selection, publish interception, the
-attestations GET route, and two true end-to-end checks against a real Express
-app and real HTTP requests.
+`fetchUpstream` gating (including its per-request `verdaccio-offline-enforcer`
+override), proxy agent selection, publish/delete interception, the attestations
+GET route, and several true end-to-end checks against a real Express app and
+real HTTP requests. `yarn test:cli` drives real npm (8-11) and yarn (classic +
+berry) binaries against a real running Verdaccio process, including a genuine
+process-restart check that a verdict persisted via `storage.localStorage`
+survives it.
 
 ## Dependencies
 

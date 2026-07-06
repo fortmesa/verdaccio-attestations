@@ -16,6 +16,15 @@ filters:
 
 middlewares:
   '@fortmesa/verdaccio-attestations': {} # required -- see "Why middlewares is not optional" below
+
+  # Optional -- if configured (even alongside this plugin, not necessarily
+  # actually enabled), this plugin's own fetchUpstream is additionally
+  # gated per-request by this same online/offline policy -- see
+  # "fetchUpstream and live upstream calls" below. Its absence just means
+  # every request gets the static fetchUpstream value above, unconditionally.
+  '@fortmesa/verdaccio-offline-enforcer':
+    online: []
+    offline: []
 ```
 
 ## Why `middlewares` is not optional
@@ -99,11 +108,7 @@ version is also blocked.
 ## fetchUpstream and live upstream calls
 
 Default **`false`**. This plugin never contacts `registry.npmjs.org` directly
-unless explicitly opted into. `verdaccio-offline-enforcer`'s online/offline
-policy governs Verdaccio's own uplink fetches, but has no visibility into this
-plugin's own direct HTTP calls -- defaulting to "never fetch" is the only way
-this plugin can't quietly bypass whatever egress policy governs a given
-deployment.
+unless explicitly opted into.
 
 **With `fetchUpstream: false`** (default): a version with no locally-stored
 attestation is treated as unverifiable -- blocked, if a `block` rule covers it
@@ -117,14 +122,60 @@ cryptographic verification -- see [Verification](#verification) below) runs in
 the background (see
 [Fast-tier / background verification](#fast-tier--background-verification)
 below); a `GET` to the attestations route for a package with nothing stored
-locally relays the raw upstream response instead of 404ing.
+locally relays the raw upstream response instead of 404ing -- **for the
+requesting identity's own request**, see below.
 
 The two "not yet known" outcomes -- missing `dist.integrity` to verify against,
-and `fetchUpstream` being disabled -- are deliberately **not** persisted to
-storage or cached past the single request that produced them: turning
-`fetchUpstream` on later, or a subsequent read that does have `dist.integrity`,
-gets a real re-attempt rather than a permanently calcified `.bad` verdict from
-before the missing piece was available.
+and `fetchUpstream` being disabled or effectively disabled for this request --
+are deliberately **not** persisted to storage or cached past the single request
+that produced them: turning `fetchUpstream` on later, or a subsequent read that
+does have `dist.integrity`, gets a real re-attempt rather than a permanently
+calcified bad verdict from before the missing piece was available.
+
+### Per-request override: `verdaccio-offline-enforcer` identities never trigger a live fetch
+
+`fetchUpstream: true` is a whole-deployment default, but a single Verdaccio
+process can serve two different kinds of caller with two different real network
+postures -- a developer's own `npm install` typically has live internet access,
+while a CI/CD job's own dependency installs are often deliberately air-gapped
+(no upstream fallback at all, so a build only ever resolves packages already
+known locally) via
+[`verdaccio-offline-enforcer`](https://github.com/fortmesa/verdaccio-offline-enforcer)'s
+online/offline identity policy. The static `fetchUpstream` config can't express
+that distinction by itself.
+
+So the actual, per-request answer to "is a live fetch allowed right now" is:
+`fetchUpstream` config **AND** this specific request's identity is not
+offline-restricted, per `verdaccio-offline-enforcer`'s own online/offline policy
+-- read directly from that plugin's `middlewares:` config section
+(`options.config.middlewares['@fortmesa/verdaccio-offline-enforcer']`), not from
+any runtime signal `verdaccio-offline-enforcer` produces. (Its own gating can
+swallow a request internally without ever calling `next()`, and this plugin's
+own `GET /-/npm/v1/attestations/...` route is always exempted by that plugin's
+own `/-/` passthrough rule -- there's no shared middleware-ordering point both
+plugins could rely on for a runtime signal to work in every case; config-sharing
+was verified to work in every case, a runtime signal was verified NOT to.)
+
+This plugin duplicates `verdaccio-offline-enforcer`'s tiny `_isRestricted()`
+matching logic (name/group vs. `online`/`offline` sets, `online` always wins,
+`enforceForAnonymous`/`enforceForUnknown` deciding everyone else -- see that
+plugin's own docs for the exact semantics) against the _same_ config values,
+rather than sharing code across the two packages. **`verdaccio-offline-enforcer`
+does not need to be installed or enabled at all** -- if its config section is
+absent, every request behaves exactly as `fetchUpstream` alone says, using that
+plugin's own documented defaults (`enforceForAnonymous: true`,
+`enforceForUnknown: false`) as if an empty `online`/`offline` list were
+configured.
+
+These two plugins are maintained together; a config-shape change on
+`verdaccio-offline-enforcer`'s side (its `online`/`offline` keys were already
+renamed once from `onlineUsernames`/`offlineUsernames`) is expected to come with
+a matching update here, not defended against with a compatibility shim.
+
+A non-HTTP code path (e.g. Verdaccio's own web-UI package listing) has no
+request/identity to evaluate at all -- `fetchUpstream` is treated as `false`
+there regardless of config, the same fail-closed default `enforceForAnonymous`
+already establishes for an anonymous HTTP request.
 
 ## Fast-tier / background verification
 
@@ -136,7 +187,7 @@ tier per gated version:
    embedded, e.g. from a local publish this same process handled), or an
    in-memory cache hit from a verdict this process already resolved.
 2. **Fast** -- peek, plus (on a cache miss) exactly one persisted-storage read
-   of the `.good`/`.bad` object described in
+   of the object described in
    [Storage design](#storage-design-one-object-per-packageversion) below --
    still no network, no cryptographic verification, cheap enough to pay on every
    metadata read.
@@ -197,27 +248,101 @@ Exactly **one** stored object per package version -- not a separate marker file
 alongside a raw bundle. Object-storage backends (this deployment's own S3 usage
 included) typically bill per object with a real minimum regardless of content
 size, so a second, often-tiny file per version would be a genuine cost at this
-data's scale. The verdict is instead encoded directly in the stored object's own
-filename extension: `<name-with-/-replaced-by-->-<version>.good` or `....bad`,
-never both, alongside the tarball in the same per-package storage location.
+data's scale. Named `<name-with-/-replaced-by-->-<version>.attestation`,
+alongside the tarball in the same per-package storage location, holding
+`{verified, bundle, reason}` (`reason` present only when `verified: false`) --
+the verdict is a field in the object's own contents, not encoded in its
+filename, so a lookup is a single hit-or-miss, never two attempts to tell "known
+bad" apart from "never checked".
 
-This is built **only** on the generic `addTarball`/`getTarball` interface every
-Verdaccio storage backend (S3, filesystem, or otherwise) implements --
-deliberately not S3-specific object metadata or tags, so this plugin works
-identically regardless of which storage backend a given deployment is configured
-with.
+### Why `storage.localStorage`, not `storage` directly
 
-A `.good` object holds `{bundle}`; a `.bad` object holds `{bundle, reason}`
-(when a bundle was actually retrieved and failed verification) or just
-`{reason}` (when there was never a bundle to store at all, e.g. no attestation
-found upstream). Reading is a simple try-`.good`-then-`.bad` probe -- a genuine
-"never resolved" is the only case where neither object exists.
+`register_middlewares(app, auth, storage)`'s `storage` parameter is Verdaccio
+core's top-level orchestrating `Storage` class -- and its own
+`addTarball`/`getTarball` must **never** be used for this plugin's verdict
+storage. `Storage.getTarball()`, on any miss, automatically falls back to
+syncing metadata from the uplink, which re-invokes every registered filter's
+`filter_metadata()` -- including this plugin's own. Since a version's very first
+fast-tier storage check is _guaranteed_ to miss (nothing has been persisted
+yet), calling `Storage.getTarball()` from inside `filter_metadata()` recurses
+into itself without end. This is real, confirmed behavior (a real Verdaccio
+process hangs indefinitely this way, for a purely local package with zero
+uplinks configured too -- not specific to proxied packages), not a theoretical
+concern.
 
-**Pod-restart durability**: a verdict persisted before a restart is found on the
-very _first_ metadata read afterward, at the fast tier described above -- a
-fresh process's empty in-memory cache is irrelevant, since the persisted object
-is checked before ever falling back to the (background-only) real resolution. No
-re-fetch, no re-verification.
+`storage.localStorage` is a different, lower-level class Verdaccio's own
+`Storage` wraps -- a plain, ordinary (non-private) property -- whose own
+`addTarball`/`getTarball`/`removeTarball` are thin wrappers directly over
+whatever storage plugin is actually configured (filesystem or S3), with no
+uplink fallback and no filter re-check at all. This plugin uses that instead,
+via the same generic interface every Verdaccio storage backend implements --
+deliberately not S3-specific object metadata or tags, so behavior is identical
+regardless of which backend a deployment is configured with.
+`storage.localStorage` has existed under that exact name since Verdaccio 2.3.0
+(2017), unchanged through the 3.0 TypeScript rewrite and the 5→6 major version
+jump -- stable in practice, though it is an internal implementation detail
+Verdaccio's plugin API does not formally document or guarantee.
+
+### In-memory-only fallback
+
+If no `storage.localStorage` is reachable at all -- this plugin's own
+`filters:`/`middlewares:` instance never received one via `register_middlewares`
+(see the constructor comment on `PLUGIN_CONFIG_KEY` for why Verdaccio
+instantiates this plugin twice, once per role, and only the `middlewares:`
+instance ever receives `storage`), and no sibling instance in the same process
+has either -- every storage read/write degrades silently to the in-memory
+verdict cache alone, rather than throwing. Verification still works correctly
+for the lifetime of that one process; it simply doesn't survive a restart, and
+every replica ends up separately re-verifying a given package@version at least
+once on its own.
+
+### Verdict lifecycle matches its tarball's, deliberately never more
+
+A stored verdict is treated as inseparable from the real tarball it corresponds
+to -- it is not expired, deduplicated, or independently garbage-collected on any
+timer. The guiding principle: **this plugin never resolves a lifecycle gap that
+Verdaccio core itself leaves unresolved for the real tarball** -- it matches
+Verdaccio's own behavior, it does not improve on it.
+
+- **Full package removal** (`npm unpublish <pkg> --force`) already cleans this
+  up for free, today, no code needed: Verdaccio's own `removePackage()` deletes
+  every `_attachments` entry, and this plugin's stored object is registered as
+  just another attachment (`addTarball`'s own success handler does this,
+  regardless of caller).
+- **A single tarball's dedicated delete**
+  (`DELETE /:package/-/:filename/-rev/:revision`) is intercepted the same way
+  publish is, and removes the correspondingly-named verdict object too.
+- **Single-version unpublish, package otherwise unchanged** (a `PUT` with one
+  fewer version than before) is deliberately **not** handled -- Verdaccio's own
+  `changePackage()` doesn't delete the real tarball in this case either, only
+  clears a bookkeeping field, so this plugin's verdict is allowed to go orphaned
+  exactly when the real tarball would too. This was investigated for a subtler
+  correctness risk (Verdaccio doesn't prevent republishing the exact same
+  version number after this kind of unpublish, unlike real npmjs.org's own
+  policy) and confirmed safe: Verdaccio's own `addVersion()` separately checks
+  the real tarball attachment's retained shasum and rejects a republish with
+  genuinely different content outright, and this plugin's own publish
+  interception never persists a verdict for a rejected publish either. An
+  orphaned verdict here is inert, not incorrect.
+- Deliberately **no TTL-based expiration**: a verified Sigstore verdict is a
+  permanent cryptographic fact, not something that goes stale with time (the
+  short-lived Fulcio certificate involved is checked against the Rekor
+  transparency log's own recorded signing time, never wall-clock "now" -- this
+  is exactly what makes Sigstore verification valid indefinitely). Expiring a
+  correct verdict would only mean redoing identical work later for zero benefit,
+  so it is not done.
+- Out-of-band storage edits bypassing Verdaccio's own HTTP API entirely (a
+  manual restore, a hand-edited object) are unobservable to any hook-based
+  plugin and are not something this design accounts for.
+
+**Pod-restart durability**: with `storage.localStorage` reachable (see above), a
+verdict persisted before a restart is found on the very _first_ metadata read
+afterward, at the fast tier described above -- a fresh process's empty in-memory
+cache is irrelevant, since the persisted object is checked before ever falling
+back to the (background-only) real resolution. No re-fetch, no re-verification.
+Without `storage.localStorage` reachable, see
+[In-memory-only fallback](#in-memory-only-fallback) above instead -- this
+guarantee does not hold.
 
 ## Proxy support
 
@@ -295,9 +420,31 @@ URL-decoding.
 Prefers whatever's already stored -- in the ordinary case, `filter_metadata()`
 already ran on the packument fetch that surfaced this URL to the client in the
 first place, so this is usually a hit. On a genuine miss, this relays the raw
-upstream response (if `fetchUpstream` allows it; 404s otherwise) without caching
-it -- caching a verdict here would need the package's `dist.integrity` to verify
+upstream response (if `fetchUpstream` allows it -- see
+[Per-request override](#per-request-override-verdaccio-offline-enforcer-identities-never-trigger-a-live-fetch)
+above for what that means per-request; 404s otherwise) without caching it --
+caching a verdict here would need the package's `dist.integrity` to verify
 against, which a bare attestations `GET` doesn't carry.
+
+## DELETE `/:package/-/:filename/-rev/:revision` route (tarball deletion)
+
+Intercepted the same way `PUT` is -- a middleware parses `req.path` directly
+(the package name and real tarball filename) rather than waiting for Verdaccio's
+own router to populate `req.params`, since this middleware runs before that
+router mounts. The real tarball's own filename is stripped of its package-name
+prefix (scope excluded -- confirmed against a real npmjs.org response that a
+scoped package's tarball filename omits the scope, e.g. `core-3.0.1.tgz` for
+`@actions/core`) and `.tgz` suffix to recover the version, which is unambiguous
+specifically because the package name is already known from the route, not
+guessed from the filename alone.
+
+Deferred to the response's own `finish` event and gated on a non-3xx status,
+same as publish-time storage (see
+[Publish-time interception](#publish-time-interception) above) -- a rejected
+delete (e.g. permission denied) never triggers cleanup for a tarball that's
+still actually there. See
+[Verdict lifecycle matches its tarball's](#verdict-lifecycle-matches-its-tarballs-deliberately-never-more)
+above for which deletion paths this plugin does and does not follow.
 
 ## Logging
 
@@ -327,4 +474,10 @@ into the hex digest an attestation subject's digest is checked against.
 [Proxy support](#proxy-support) above), unused without `auth.config.https_proxy`
 configured. `body-parser` -- parses the publish request body ahead of
 Verdaccio's own parsing, to intercept a `.sigstore` attachment before
-Verdaccio's `hasDiffOneKey()` check ever runs.
+Verdaccio's `hasDiffOneKey()` check ever runs. Node's built-in
+`node:async_hooks` (`AsyncLocalStorage`) -- carries the current request's
+offline-restriction decision from `register_middlewares()` (real `req` access)
+down into `filter_metadata()` and the attestations route handler (neither has
+`req` access at all) -- no external package, but worth calling out since it's
+load-bearing for the
+[per-request fetchUpstream override](#per-request-override-verdaccio-offline-enforcer-identities-never-trigger-a-live-fetch).
