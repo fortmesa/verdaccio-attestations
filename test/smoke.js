@@ -1188,6 +1188,53 @@ async function main() {
   );
 
   await check(
+    'with fetchUpstream enabled, an offline-restricted identity still gets a 404, never a live fetch, on the dedicated attestations route',
+    async () => {
+      // The exact path docs/configuration.md's "Per-request override"
+      // section calls out as the tricky one: verdaccio-offline-enforcer's
+      // own middleware exempts anything under /-/ (this route included),
+      // so a runtime signal from that plugin would never restrict this
+      // request -- this plugin has to enforce the restriction itself,
+      // independent of whether offline-enforcer's own middleware even ran.
+      let fetchCalls = 0;
+      const plugin = makeAttestations(
+        {fetchUpstream: true},
+        {
+          fetch: async () => {
+            fetchCalls += 1;
+            return {ok: true, json: async () => REAL_ATTESTATIONS};
+          },
+        },
+      );
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
+
+      let statusCode;
+      const res = {
+        status(code) {
+          statusCode = code;
+          return this;
+        },
+        json() {
+          return this;
+        },
+        end() {},
+      };
+      await requestContext.run({offlineRestricted: true}, () =>
+        plugin._handleGetAttestations(
+          {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
+          res,
+        ),
+      );
+      assert.equal(
+        fetchCalls,
+        0,
+        "an offline-restricted identity's request to this route must never trigger a live upstream fetch",
+      );
+      assert.equal(statusCode, 404);
+    },
+  );
+
+  await check(
     '404s when neither local storage nor (disabled) upstream has anything',
     async () => {
       const plugin = makeAttestations({}, {fetch: makeFakeFetch({})});
