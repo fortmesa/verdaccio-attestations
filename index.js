@@ -20,6 +20,11 @@ const https = require('node:https');
 const {AsyncLocalStorage} = require('node:async_hooks');
 const {HttpsProxyAgent} = require('https-proxy-agent');
 const {verifyBundle, verifyAttestationsResponse} = require('./verify');
+const {
+  loadSigningKeys,
+  normalizeUpstreamKeysResponse,
+  keyStorageFilename,
+} = require('./keys');
 
 // Must match this package's name -- Verdaccio's plugin loader resolves a
 // scoped package name verbatim as the config key, and both `filters:` and
@@ -49,6 +54,36 @@ const DEFAULT_UPSTREAM_REGISTRY = 'https://registry.npmjs.org';
 // can add to a metadata read's latency, so a slow/unresponsive upstream
 // can't turn into a hung install instead of a (still fast) block.
 const UPSTREAM_FETCH_TIMEOUT_MS = 5000;
+
+const NPM_KEYS_PATH = '/-/npm/v1/keys';
+// Leading "." makes this an invalid, unpublishable npm package name (npm
+// itself rejects a package name starting with "." or "_") -- deliberately so:
+// this is a fake "package name" used purely as this plugin's own storage
+// namespace via the same generic storage.localStorage.addTarball/getTarball
+// interface _readBundle/_storeBundle already use for verdicts, and it must
+// never be reachable by a real publish, which would otherwise let an
+// attacker with publish rights collide with (or overwrite) this plugin's own
+// registry-signing-key storage.
+const REGISTRY_KEYS_NAMESPACE = '.verdaccio-attestations-registry-keys';
+// storage.localStorage has no listing/enumeration capability at all (see
+// _getLocalStorage()'s own comment -- it's a thin addTarball/getTarball/
+// removeTarball wrapper, nothing more), so there is no way to ask "what
+// upstream keys have I already stored" other than tracking that list
+// ourselves, in one more object alongside the per-keyid ones.
+const REGISTRY_KEYS_INDEX_FILENAME = 'index.json';
+// Deliberately not gated behind fetchUpstream, unlike every other upstream
+// call in this plugin: fetchUpstream governs whether THIS plugin verifies
+// SLSA attestations, an opt-in feature. Registry signatures are a completely
+// different, universal mechanism -- registry.npmjs.org signs every package
+// at its own publish time, and Verdaccio's own core uplink-proxying already
+// relays that dist.signatures field in every proxied packument
+// unconditionally, with or without fetchUpstream. Gating the corresponding
+// GET /-/npm/v1/keys relay on fetchUpstream would mean the signature keeps
+// flowing through by default (fetchUpstream: false) while the key needed to
+// verify it never does -- reproducing, for every proxied package, the exact
+// `npm audit signatures` EMISSINGSIGNATUREKEY failure this feature exists to
+// fix. See docs/configuration.md's "Registry signatures" section.
+const REGISTRY_KEYS_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 // Carries the current request's offline-restriction decision from
 // register_middlewares() (real req access) down into filter_metadata() and
@@ -299,6 +334,34 @@ class Attestations {
     this.trustedPublishers = compileTrustedPublishers(
       this.sigstoreOptions.trustedPublishers ?? [],
     );
+
+    // Our own registry-signature signing key(s) -- see keys.js. One entry
+    // per configured secret directory (a mounted cert-manager-style
+    // kubernetes.io/tls Secret: tls.crt + tls.key), so a rotation can add a
+    // new key alongside an old one rather than requiring an atomic swap.
+    // Fails loud at construction (inside loadSigningKeys/loadSigningKey) on
+    // a bad path or unsupported key type -- same principle
+    // compileRules()/compileTrustedPublishers() above already apply: a
+    // misconfigured signing key should never silently mean "no signing
+    // happens" when an operator configured one expecting it to be in effect.
+    if (
+      this.sigstoreOptions.signingKeys !== undefined &&
+      !Array.isArray(this.sigstoreOptions.signingKeys)
+    ) {
+      throw new Error(
+        'verdaccio-attestations: sigstore.signingKeys must be an array of secret directory paths',
+      );
+    }
+    this.signingKeys = loadSigningKeys(this.sigstoreOptions.signingKeys ?? []);
+
+    // keyid -> {keyid, expires, keytype, scheme, key}, relayed from every
+    // configured uplink's own GET /-/npm/v1/keys -- see
+    // _refreshUpstreamKeys() below. Warm-started from persisted storage in
+    // register_middlewares(), not here: this constructor has no storage/auth
+    // handle yet (see the sharedStorage/sharedAuth comment above for why
+    // those only arrive via register_middlewares).
+    this._upstreamKeysCache = options.upstreamKeysCache ?? new Map();
+    this._upstreamKeysRefreshTimer = null;
 
     // Default false: this plugin never talks to the real npm registry
     // unless explicitly opted into. When false, a proxied package with no
@@ -750,11 +813,180 @@ class Attestations {
     return null;
   }
 
+  // Every distinct configured uplink's own URL -- deliberately not scoped to
+  // one package's own proxy: list (unlike _resolveUpstreamRegistryUrls()
+  // above), since a registry signing key isn't package-specific the way an
+  // attestation is. Any uplink could plausibly be the source of a proxied
+  // package carrying a signature from it, so every configured uplink's keys
+  // are relayed, not just the ones some already-known package happens to use.
+  _configuredUplinkUrls() {
+    const uplinks = this._getAuth()?.config?.uplinks ?? {};
+    return Object.values(uplinks)
+      .map(u => u?.url)
+      .filter(Boolean);
+  }
+
+  async _readRegistryKeysIndex() {
+    try {
+      return await this._readBundle(
+        REGISTRY_KEYS_NAMESPACE,
+        REGISTRY_KEYS_INDEX_FILENAME,
+      );
+    } catch {
+      return {keyids: []}; // never written yet, or no persistent storage
+    }
+  }
+
+  // Warm start: populates the in-memory cache from whatever was already
+  // persisted before this process started, so GET /-/npm/v1/keys has
+  // real answers immediately rather than an empty list until the first
+  // refresh cycle completes. No-op (not an error) when no persistent
+  // storage is reachable at all -- same in-memory-only degradation every
+  // other storage-backed feature in this plugin already falls back to.
+  async _loadUpstreamKeysFromStorage() {
+    if (!this._getLocalStorage()) return;
+    const index = await this._readRegistryKeysIndex();
+    for (const keyid of index.keyids ?? []) {
+      try {
+        const entry = await this._readBundle(
+          REGISTRY_KEYS_NAMESPACE,
+          keyStorageFilename(keyid),
+        );
+        this._upstreamKeysCache.set(keyid, entry);
+      } catch (err) {
+        this.logger.warn(
+          {keyid, err: err.message},
+          'verdaccio-attestations: failed to load stored upstream registry key @{keyid}',
+        );
+      }
+    }
+  }
+
+  async _fetchUpstreamKeysFrom(registryUrl) {
+    try {
+      const res = await this._fetch(
+        `${registryUrl.replace(/\/$/, '')}${NPM_KEYS_PATH}`,
+        {
+          agent: this._requestAgent(),
+          signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
+        },
+      );
+      if (!res.ok) return [];
+      return normalizeUpstreamKeysResponse(await res.json());
+    } catch (err) {
+      this.logger.warn(
+        {registryUrl, err: err.message},
+        'verdaccio-attestations: failed to fetch registry signing keys from upstream',
+      );
+      return [];
+    }
+  }
+
+  // Refreshes the in-memory cache (and persists whatever's new/changed) from
+  // every configured uplink's own GET /-/npm/v1/keys. A key already known
+  // with identical contents is neither re-persisted nor counted as an index
+  // change -- upstream signing keys rotate on the order of months to years,
+  // so in the ordinary case this is a no-op past the very first cycle.
+  async _refreshUpstreamKeys() {
+    const urls = this._configuredUplinkUrls();
+    if (urls.length === 0) return;
+
+    const fetched = (
+      await Promise.all(urls.map(url => this._fetchUpstreamKeysFrom(url)))
+    ).flat();
+
+    const index = await this._readRegistryKeysIndex();
+    const knownKeyids = new Set(index.keyids ?? []);
+    let indexChanged = false;
+
+    for (const entry of fetched) {
+      const existing = this._upstreamKeysCache.get(entry.keyid);
+      if (existing && JSON.stringify(existing) === JSON.stringify(entry)) {
+        continue; // unchanged -- skip a redundant persisted write
+      }
+      this._upstreamKeysCache.set(entry.keyid, entry);
+      if (this._getLocalStorage()) {
+        await this._storeBundle(
+          REGISTRY_KEYS_NAMESPACE,
+          keyStorageFilename(entry.keyid),
+          entry,
+        ).catch(err =>
+          this.logger.warn(
+            {keyid: entry.keyid, err: err.message},
+            'verdaccio-attestations: failed to persist upstream registry key @{keyid}',
+          ),
+        );
+      }
+      if (!knownKeyids.has(entry.keyid)) {
+        knownKeyids.add(entry.keyid);
+        indexChanged = true;
+      }
+    }
+
+    if (indexChanged && this._getLocalStorage()) {
+      await this._storeBundle(
+        REGISTRY_KEYS_NAMESPACE,
+        REGISTRY_KEYS_INDEX_FILENAME,
+        {keyids: [...knownKeyids]},
+      ).catch(err =>
+        this.logger.warn(
+          {err: err.message},
+          'verdaccio-attestations: failed to persist upstream registry keys index',
+        ),
+      );
+    }
+  }
+
+  // Runs once immediately (so a freshly-started pod doesn't wait a full
+  // interval before GET /-/npm/v1/keys has any upstream keys at all beyond
+  // whatever warm-started from storage), then on a fixed interval. unref()'d
+  // so this timer alone never keeps a process (or a test run) alive -- same
+  // idiom verdaccio-security-filter's own OSV sync loop already uses. Guarded
+  // against double-start since register_middlewares() runs once per plugin
+  // instance in real deployment, but nothing prevents a test from calling it
+  // more than once on the same instance.
+  _startUpstreamKeysRefreshLoop() {
+    if (this._upstreamKeysRefreshTimer) return;
+    const run = () => {
+      this._trackBackground(
+        'upstream-keys-refresh',
+        this._refreshUpstreamKeys().catch(err =>
+          this.logger.warn(
+            {err: err.message},
+            'verdaccio-attestations: upstream registry keys refresh cycle failed',
+          ),
+        ),
+      );
+    };
+    run();
+    this._upstreamKeysRefreshTimer = setInterval(
+      run,
+      REGISTRY_KEYS_REFRESH_INTERVAL_MS,
+    );
+    this._upstreamKeysRefreshTimer.unref?.();
+  }
+
   register_middlewares(app, auth, storage) {
     this._storage = storage;
     this._auth = auth;
     sharedStorage = storage;
     sharedAuth = auth;
+
+    // Warm-start the in-memory upstream-keys cache from whatever's already
+    // persisted, then start the ongoing refresh loop -- see both methods'
+    // own comments above. Tracked via _trackBackground like every other
+    // background write in this plugin, so a test can await it via
+    // whenAllBackgroundWorkSettles() instead of guessing a timeout.
+    this._trackBackground(
+      'load-stored-registry-keys',
+      this._loadUpstreamKeysFromStorage().catch(err =>
+        this.logger.warn(
+          {err: err.message},
+          'verdaccio-attestations: failed to warm-start stored upstream registry keys',
+        ),
+      ),
+    );
+    this._startUpstreamKeysRefreshLoop();
 
     // Unconditional and first: establishes this request's offline-
     // restriction context before anything else in this plugin (or
@@ -858,6 +1090,24 @@ class Attestations {
           'verdaccio-attestations: unexpected error serving attestations',
         );
         res.status(500).end();
+      });
+    });
+
+    // Unconditional, same as the attestations route above -- see
+    // REGISTRY_KEYS_REFRESH_INTERVAL_MS's own comment for why this is not
+    // gated behind fetchUpstream. Combines every relayed upstream key with
+    // this deployment's own configured signing keys (if any) into the one
+    // real npm/pacote clients query -- npm-package-arg-shaped scoping (which
+    // uplink a given package actually came from) is not needed here: a
+    // client's own dist.signatures.keyid is what's actually being looked up
+    // against this list, and npm's client-side verification already only
+    // ever looks for the one specific keyid a package's own signature names.
+    app.get(NPM_KEYS_PATH, (req, res) => {
+      res.status(200).json({
+        keys: [
+          ...this._upstreamKeysCache.values(),
+          ...this.signingKeys.map(key => key.publicKeyEntry),
+        ],
       });
     });
   }
@@ -971,6 +1221,31 @@ class Attestations {
       reason: result.reason,
       predicateType: result.predicateType,
     };
+
+    // Sign with our own registry key(s) only when trustedPublishers is BOTH
+    // configured and actually matched -- not merely "verified", and never
+    // when trustedPublishers is unconfigured at all. verifyBundle() only
+    // ever returns verified: true here despite a non-empty trustedPublishers
+    // list if matchesTrustedPublisher() already passed (see verify.js), so
+    // this.trustedPublishers.length > 0 && result.verified is exactly that
+    // condition -- no separate signal needs threading through result itself.
+    // A verified-but-not-identity-checked signature (trustedPublishers
+    // unconfigured) proves the tarball came from *some* Sigstore-authenticated
+    // build, not that it came from a publisher this deployment actually
+    // trusts -- signing that with our own key would let a downstream
+    // `npm audit signatures` treat it as equally trustworthy as a real
+    // trustedPublishers match, which it isn't.
+    if (
+      this.signingKeys.length > 0 &&
+      this.trustedPublishers.length > 0 &&
+      result.verified
+    ) {
+      const message = `${packageName}@${version}:${integrity}`;
+      versionMeta.dist.signatures = this.signingKeys.map(key => ({
+        keyid: key.keyid,
+        sig: key.sign(message),
+      }));
+    }
 
     delete body._attachments[sigstoreKey];
 

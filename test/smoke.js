@@ -5,6 +5,7 @@ const {EventEmitter} = require('node:events');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const express = require('express');
 const {
   Attestations,
@@ -16,6 +17,13 @@ const {
   verifyAttestationsResponse,
   matchesTrustedPublisher,
 } = require('../verify.js');
+const {
+  loadSigningKeys,
+  normalizeUpstreamKeysResponse,
+  keyStorageFilename,
+} = require('../keys.js');
+
+const SIGNING_KEY_FIXTURE_DIR = path.join(__dirname, 'fixtures/signing-key');
 
 // Simulates "a real, non-offline-restricted request came in" around a
 // direct method call (filter_metadata/_handleGetAttestations/etc.) that
@@ -1908,6 +1916,615 @@ async function main() {
         );
         assert.equal(fetchCalls, 1, 'must not have crashed or re-fetched');
       });
+    },
+  );
+
+  // --- keys.js: loading our own signing key(s) ---
+
+  await check(
+    'keys.js: loadSigningKeys loads a real EC P-256 tls.crt/tls.key pair and computes a stable keyid',
+    async () => {
+      const [key] = loadSigningKeys([SIGNING_KEY_FIXTURE_DIR]);
+      assert.match(key.keyid, /^SHA256:[A-Za-z0-9+/]{40,50}$/);
+      assert.equal(key.publicKeyEntry.keyid, key.keyid);
+      assert.equal(key.publicKeyEntry.keytype, 'ecdsa-sha2-nistp256');
+      assert.equal(key.publicKeyEntry.scheme, 'ecdsa-sha2-nistp256');
+      assert.ok(
+        key.expires,
+        "expires must be populated from the cert's own validTo",
+      );
+
+      // Loading the same directory twice must produce the exact same keyid --
+      // a stable, reproducible function of the public key alone, not
+      // per-process randomness.
+      const [again] = loadSigningKeys([SIGNING_KEY_FIXTURE_DIR]);
+      assert.equal(again.keyid, key.keyid);
+    },
+  );
+
+  await check(
+    'keys.js: a signature from sign() verifies with the exact PEM-reconstruction technique real npm/pacote clients use',
+    async () => {
+      const [key] = loadSigningKeys([SIGNING_KEY_FIXTURE_DIR]);
+      const message = 'left-pad@1.0.0:sha512-abc123';
+      const sig = key.sign(message);
+
+      const pem = `-----BEGIN PUBLIC KEY-----\n${key.publicKeyEntry.key.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----\n`;
+      const verifier = crypto.createVerify('SHA256');
+      verifier.write(message);
+      verifier.end();
+      assert.equal(verifier.verify(pem, sig, 'base64'), true);
+
+      const tamperedVerifier = crypto.createVerify('SHA256');
+      tamperedVerifier.write('left-pad@1.0.0:sha512-tampered');
+      tamperedVerifier.end();
+      assert.equal(
+        tamperedVerifier.verify(pem, sig, 'base64'),
+        false,
+        'a tampered message must not verify against the same signature',
+      );
+    },
+  );
+
+  await check(
+    'keys.js: loadSigningKeys rejects a non-EC or non-P-256 key loudly rather than silently accepting it',
+    async () => {
+      const tmpDir = fs.mkdtempSync(
+        path.join(require('node:os').tmpdir(), 'verdaccio-attestations-rsa-'),
+      );
+      try {
+        const {privateKey} = crypto.generateKeyPairSync('rsa', {
+          modulusLength: 2048,
+        });
+        fs.writeFileSync(
+          path.join(tmpDir, 'tls.key'),
+          privateKey.export({type: 'pkcs1', format: 'pem'}),
+        );
+        // loadSigningKey reads tls.crt (just to get an X509Certificate
+        // instance) before checking the private key's own
+        // asymmetricKeyType -- an unrelated-but-valid cert is enough here,
+        // since the EC-type check throws before the cert's own public key is
+        // ever used for anything. Reuses the real fixture's own cert file
+        // rather than generating a fresh matching one.
+        fs.copyFileSync(
+          path.join(SIGNING_KEY_FIXTURE_DIR, 'tls.crt'),
+          path.join(tmpDir, 'tls.crt'),
+        );
+        assert.throws(() => loadSigningKeys([tmpDir]), /only ECDSA P-256/);
+      } finally {
+        fs.rmSync(tmpDir, {recursive: true, force: true});
+      }
+    },
+  );
+
+  await check(
+    'keys.js: normalizeUpstreamKeysResponse filters malformed entries and defaults keytype/scheme',
+    async () => {
+      const normalized = normalizeUpstreamKeysResponse({
+        keys: [
+          {
+            keyid: 'SHA256:abc',
+            key: 'base64stuff',
+            expires: '2030-01-01T00:00:00Z',
+          },
+          {keyid: 'SHA256:def', key: 'otherbase64'}, // no expires/keytype/scheme -- must default
+          {keyid: 'SHA256:missing-key'}, // no `key` -- must be dropped
+          {key: 'no-keyid'}, // no `keyid` -- must be dropped
+          null,
+        ],
+      });
+      assert.equal(normalized.length, 2);
+      assert.deepEqual(normalized[0], {
+        keyid: 'SHA256:abc',
+        expires: '2030-01-01T00:00:00Z',
+        keytype: 'ecdsa-sha2-nistp256',
+        scheme: 'ecdsa-sha2-nistp256',
+        key: 'base64stuff',
+      });
+      assert.equal(normalized[1].expires, null);
+
+      assert.deepEqual(normalizeUpstreamKeysResponse({}), []);
+      assert.deepEqual(normalizeUpstreamKeysResponse(null), []);
+    },
+  );
+
+  await check(
+    'keys.js: keyStorageFilename produces a safe, deterministic filename for an arbitrary keyid',
+    async () => {
+      const filename = keyStorageFilename(
+        'SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA',
+      );
+      assert.match(filename, /^key-[A-Za-z0-9_]+\.json$/);
+      assert.equal(
+        keyStorageFilename(
+          'SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA',
+        ),
+        filename,
+        'must be a pure, reproducible function of the keyid',
+      );
+      // Never a "/" -- would otherwise be interpretable as a path segment by
+      // whatever storage backend is configured underneath.
+      assert.ok(!filename.includes('/'));
+    },
+  );
+
+  await check(
+    'constructor: sigstore.signingKeys must be an array, rejected loudly otherwise',
+    async () => {
+      assert.throws(
+        () =>
+          makeAttestations({sigstore: {signingKeys: SIGNING_KEY_FIXTURE_DIR}}),
+        /sigstore\.signingKeys must be an array/,
+      );
+    },
+  );
+
+  // --- Own-key signing: gated strictly on trustedPublishers configured AND matched ---
+
+  await check(
+    'publish-time signing: signs with our own key only when trustedPublishers is configured AND the identity matched',
+    async () => {
+      __resetSharedStateForTests();
+      const storage = makeFakeStorage();
+      const plugin = makeAttestations({
+        sigstore: {
+          trustedPublishers: [
+            {subjectAlternativeName: 'https://github.com/actions/toolkit/**'},
+          ],
+          signingKeys: [SIGNING_KEY_FIXTURE_DIR],
+        },
+      });
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        _attachments: {
+          'core-3.0.1.tgz.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      const versionMeta = body.versions['3.0.1'];
+      assert.equal(versionMeta.dist.attestations.verified, true);
+      assert.equal(versionMeta.dist.signatures.length, 1);
+      const {keyid, sig} = versionMeta.dist.signatures[0];
+      assert.equal(keyid, plugin.signingKeys[0].keyid);
+
+      const pem = `-----BEGIN PUBLIC KEY-----\n${plugin.signingKeys[0].publicKeyEntry.key.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----\n`;
+      const message = `@actions/core@3.0.1:${REAL_PKG.integrity}`;
+      const verifier = crypto.createVerify('SHA256');
+      verifier.write(message);
+      verifier.end();
+      assert.equal(verifier.verify(pem, sig, 'base64'), true);
+    },
+  );
+
+  await check(
+    'publish-time signing: does NOT sign when trustedPublishers is not configured, even though the attestation verified',
+    async () => {
+      __resetSharedStateForTests();
+      const storage = makeFakeStorage();
+      const plugin = makeAttestations({
+        sigstore: {signingKeys: [SIGNING_KEY_FIXTURE_DIR]},
+      });
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        _attachments: {
+          'core-3.0.1.tgz.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      const versionMeta = body.versions['3.0.1'];
+      assert.equal(versionMeta.dist.attestations.verified, true);
+      assert.equal(versionMeta.dist.signatures, undefined);
+    },
+  );
+
+  await check(
+    'publish-time signing: does NOT sign when trustedPublishers is configured but the identity did not match',
+    async () => {
+      __resetSharedStateForTests();
+      const storage = makeFakeStorage();
+      const plugin = makeAttestations({
+        sigstore: {
+          trustedPublishers: [
+            {subjectAlternativeName: 'https://github.com/some-other-org/**'},
+          ],
+          signingKeys: [SIGNING_KEY_FIXTURE_DIR],
+        },
+      });
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        _attachments: {
+          'core-3.0.1.tgz.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      const versionMeta = body.versions['3.0.1'];
+      assert.equal(versionMeta.dist.attestations.verified, false);
+      assert.equal(versionMeta.dist.signatures, undefined);
+    },
+  );
+
+  await check(
+    'publish-time signing: no signingKeys configured at all means no dist.signatures, even with trustedPublishers matched',
+    async () => {
+      __resetSharedStateForTests();
+      const storage = makeFakeStorage();
+      const plugin = makeAttestations({
+        sigstore: {
+          trustedPublishers: [
+            {subjectAlternativeName: 'https://github.com/actions/toolkit/**'},
+          ],
+        },
+      });
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        _attachments: {
+          'core-3.0.1.tgz.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      const versionMeta = body.versions['3.0.1'];
+      assert.equal(versionMeta.dist.attestations.verified, true);
+      assert.equal(versionMeta.dist.signatures, undefined);
+    },
+  );
+
+  // --- GET /-/npm/v1/keys route ---
+
+  await check(
+    'GET /-/npm/v1/keys: serves our own configured signing key(s), unconditionally',
+    async () => {
+      __resetSharedStateForTests();
+      const plugin = makeAttestations({
+        sigstore: {signingKeys: [SIGNING_KEY_FIXTURE_DIR]},
+      });
+      let routeHandler;
+      const fakeApp = {
+        use() {},
+        get(routePath, handler) {
+          if (routePath === '/-/npm/v1/keys') routeHandler = handler;
+        },
+      };
+      plugin.register_middlewares(
+        fakeApp,
+        {config: {}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      assert.ok(
+        routeHandler,
+        'GET /-/npm/v1/keys must be registered unconditionally',
+      );
+
+      const res = {
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        json(body) {
+          this.body = body;
+          return this;
+        },
+      };
+      routeHandler({}, res);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body.keys.length, 1);
+      assert.equal(res.body.keys[0].keyid, plugin.signingKeys[0].keyid);
+    },
+  );
+
+  await check(
+    'GET /-/npm/v1/keys: with no signingKeys and no relayed upstream keys, serves an empty list rather than erroring',
+    async () => {
+      __resetSharedStateForTests();
+      const plugin = makeAttestations({});
+      let routeHandler;
+      const fakeApp = {
+        use() {},
+        get(routePath, handler) {
+          if (routePath === '/-/npm/v1/keys') routeHandler = handler;
+        },
+      };
+      plugin.register_middlewares(
+        fakeApp,
+        {config: {}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+
+      const res = {
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        json(body) {
+          this.body = body;
+          return this;
+        },
+      };
+      routeHandler({}, res);
+      assert.equal(res.statusCode, 200);
+      assert.deepEqual(res.body.keys, []);
+    },
+  );
+
+  // --- Upstream registry-key relay: unconditional, persisted, warm-started ---
+
+  await check(
+    'upstream key relay: fetches GET /-/npm/v1/keys from every configured uplink unconditionally (no fetchUpstream, no sigstore config at all)',
+    async () => {
+      __resetSharedStateForTests();
+      const requestedUrls = [];
+      const upstreamKeysResponse = {
+        keys: [
+          {
+            keyid: 'SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA',
+            expires: null,
+            keytype: 'ecdsa-sha2-nistp256',
+            scheme: 'ecdsa-sha2-nistp256',
+            key: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfakekeymaterial==',
+          },
+        ],
+      };
+      const plugin = makeAttestations(
+        {}, // no fetchUpstream, no sigstore config -- must still relay
+        {
+          fetch: async url => {
+            requestedUrls.push(url);
+            return {ok: true, json: async () => upstreamKeysResponse};
+          },
+        },
+      );
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {config: {uplinks: {npmjs: {url: 'https://registry.npmjs.org'}}}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.equal(requestedUrls.length, 1);
+      assert.equal(
+        requestedUrls[0],
+        'https://registry.npmjs.org/-/npm/v1/keys',
+      );
+      assert.equal(plugin._upstreamKeysCache.size, 1);
+      assert.deepEqual(
+        plugin._upstreamKeysCache.get(
+          'SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA',
+        ),
+        upstreamKeysResponse.keys[0],
+      );
+    },
+  );
+
+  await check(
+    'upstream key relay: with no uplinks configured at all, never calls fetch',
+    async () => {
+      __resetSharedStateForTests();
+      let fetchCalls = 0;
+      const plugin = makeAttestations(
+        {},
+        {
+          fetch: async () => {
+            fetchCalls += 1;
+            throw new Error('must not be called');
+          },
+        },
+      );
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {config: {}}, // no uplinks
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      await plugin.whenAllBackgroundWorkSettles();
+      assert.equal(fetchCalls, 0);
+    },
+  );
+
+  await check(
+    'upstream key relay: relayed keys are combined with our own signing key(s) at GET /-/npm/v1/keys',
+    async () => {
+      __resetSharedStateForTests();
+      const upstreamKeysResponse = {
+        keys: [
+          {
+            keyid: 'SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA',
+            key: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfakekeymaterial==',
+          },
+        ],
+      };
+      const plugin = makeAttestations(
+        {sigstore: {signingKeys: [SIGNING_KEY_FIXTURE_DIR]}},
+        {
+          fetch: async () => ({
+            ok: true,
+            json: async () => upstreamKeysResponse,
+          }),
+        },
+      );
+      let routeHandler;
+      const fakeApp = {
+        use() {},
+        get(routePath, handler) {
+          if (routePath === '/-/npm/v1/keys') routeHandler = handler;
+        },
+      };
+      plugin.register_middlewares(
+        fakeApp,
+        {config: {uplinks: {npmjs: {url: 'https://registry.npmjs.org'}}}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      await plugin.whenAllBackgroundWorkSettles();
+
+      const res = {
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        json(body) {
+          this.body = body;
+          return this;
+        },
+      };
+      routeHandler({}, res);
+      const keyids = res.body.keys.map(k => k.keyid).sort();
+      assert.deepEqual(
+        keyids,
+        [
+          'SHA256:5DWUjCF8n7XXCTUYmhTlpB1aLzOfzVxQorKHSpgH3do',
+          'SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA',
+        ].sort(),
+      );
+    },
+  );
+
+  await check(
+    'upstream key relay: a key persisted before a restart is warm-started into a fresh instance without any live fetch',
+    async () => {
+      __resetSharedStateForTests();
+      const storage = makeFakeStorage();
+      const upstreamKeysResponse = {
+        keys: [
+          {keyid: 'SHA256:warmstart-test-key', key: 'ZmFrZS1rZXktbWF0ZXJpYWw='},
+        ],
+      };
+
+      const plugin1 = makeAttestations(
+        {},
+        {
+          fetch: async () => ({
+            ok: true,
+            json: async () => upstreamKeysResponse,
+          }),
+        },
+      );
+      plugin1.register_middlewares(
+        {use() {}, get() {}},
+        {config: {uplinks: {npmjs: {url: 'https://registry.npmjs.org'}}}},
+        wrapAsTopLevelStorage(storage),
+      );
+      await plugin1.whenAllBackgroundWorkSettles();
+      assert.equal(plugin1._upstreamKeysCache.size, 1);
+
+      // "Restart": brand-new instance, same underlying storage, fetch would
+      // throw if ever called -- register_middlewares() itself still starts a
+      // live background refresh (unconditional, see above), so this only
+      // proves the warm-start path itself, called directly, needs no fetch.
+      __resetSharedStateForTests();
+      const plugin2 = makeAttestations({});
+      plugin2._storage = wrapAsTopLevelStorage(storage);
+      await plugin2._loadUpstreamKeysFromStorage();
+      assert.equal(plugin2._upstreamKeysCache.size, 1);
+      // Persisted (and therefore warm-started) in the normalized shape
+      // normalizeUpstreamKeysResponse() produces -- not the raw, possibly
+      // partial shape the upstream response itself carried.
+      assert.deepEqual(
+        plugin2._upstreamKeysCache.get('SHA256:warmstart-test-key'),
+        {
+          keyid: 'SHA256:warmstart-test-key',
+          expires: null,
+          keytype: 'ecdsa-sha2-nistp256',
+          scheme: 'ecdsa-sha2-nistp256',
+          key: 'ZmFrZS1rZXktbWF0ZXJpYWw=',
+        },
+      );
+    },
+  );
+
+  await check(
+    "upstream key relay: an upstream fetch failure for one uplink does not prevent another uplink's keys from being relayed",
+    async () => {
+      __resetSharedStateForTests();
+      const plugin = makeAttestations(
+        {},
+        {
+          fetch: async url => {
+            if (url.includes('flaky')) throw new Error('ECONNREFUSED');
+            return {
+              ok: true,
+              json: async () => ({
+                keys: [{keyid: 'SHA256:from-good-uplink', key: 'Z29vZC1rZXk='}],
+              }),
+            };
+          },
+        },
+      );
+      plugin.register_middlewares(
+        {use() {}, get() {}},
+        {
+          config: {
+            uplinks: {
+              flaky: {url: 'https://flaky.example.com'},
+              good: {url: 'https://good.example.com'},
+            },
+          },
+        },
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      await plugin.whenAllBackgroundWorkSettles();
+      assert.equal(plugin._upstreamKeysCache.size, 1);
+      assert.ok(plugin._upstreamKeysCache.has('SHA256:from-good-uplink'));
     },
   );
 

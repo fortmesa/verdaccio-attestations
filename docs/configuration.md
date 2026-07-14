@@ -27,6 +27,13 @@ filters:
       #     - subjectAlternativeName: 'https://github.com/fortmesa/verdaccio-attestations/**'
       #     - issuer: 'https://token.actions.githubusercontent.com'
       #       subjectAlternativeName: 'https://github.com/fortmesa/*/**'
+      # signingKeys: [] # optional -- see "Registry signatures" below. One
+      # secret directory path per entry (each a mounted cert-manager-style
+      # kubernetes.io/tls Secret: tls.crt + tls.key), ECDSA P-256 only. Empty
+      # (the default) means this deployment never signs a local publish with
+      # its own registry key, regardless of trustedPublishers:
+      #   signingKeys:
+      #     - /var/run/secrets/verdaccio-attestations-signing-key
 
 middlewares:
   '@fortmesa/verdaccio-attestations': {} # required -- see "Why middlewares is not optional" below
@@ -321,6 +328,158 @@ returns the bundle that actually produced the verdict alongside it -- a caller
 that needs to persist "the bundle this verdict is about" cannot assume
 `attestations[0]` is it.
 
+## Registry signatures
+
+A **completely separate mechanism** from everything in
+[Verification](#verification) above, easy to conflate with it but answering a
+different question. SLSA provenance attestations (what `verifyBundle()` checks)
+are Sigstore/Fulcio-based, opt-in per package (only a `--provenance` publish
+carries one), and keyless. npm's own **registry signature** scheme
+(`dist.signatures` on a version's metadata, verified against
+`GET /-/npm/v1/keys`) is npm-registry-key-based, **universal**
+(`registry.npmjs.org` signs every package it hosts, whether or not that package
+also carries SLSA provenance), and is what
+`npm audit signatures`/`npm install`'s own signature check actually reads for
+the common case of an ordinary, non-attested proxied package.
+
+**Why this registry needs to participate in it at all.** Verdaccio's own core
+uplink-proxying already relays a proxied package's `dist.signatures` field
+verbatim -- that part needs no code here. What's missing is the other half of
+that check: `GET /-/npm/v1/keys`, which a real npm/yarn client always queries
+against **whatever registry it's configured against** (this one), never the
+literal upstream host. Without this registry serving that route at all,
+`npm audit signatures` fails outright -- confirmed directly:
+
+```
+npm error code EMISSINGSIGNATUREKEY
+npm error fast-deep-equal@3.1.3 has a registry signature with keyid:
+SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA but no corresponding
+public key can be found
+```
+
+for `fast-deep-equal@3.1.3` -- an ordinary proxied package with no SLSA
+attestation at all, so `fetchUpstream`/`sigstore.trustedPublishers` were never
+even in play. `npm audit signatures` uses `p-map` with `stopOnError: true`
+internally, so this single missing key aborts the _entire_ audit run, not just
+the one package.
+
+### `GET /-/npm/v1/keys`
+
+Registered unconditionally (same as the attestations route), serving the union
+of:
+
+1. Every upstream registry signing key this deployment has relayed (see
+   [Upstream key relay](#upstream-key-relay) below).
+2. This deployment's own configured `sigstore.signingKeys` (see
+   [Registry-signing a local publish](#registry-signing-a-local-publish) below),
+   if any.
+
+### Upstream key relay
+
+Fetches `GET /-/npm/v1/keys` from **every** configured uplink (`config.uplinks`,
+not scoped to any one package's own `proxy:` list the way attestation fetches
+are -- a registry signing key isn't package-specific, so every configured
+uplink's keys are relayed, not just the ones some already-known package happens
+to use), on an unref'd, self-rescheduling timer (every 6 hours, plus an
+immediate first run on startup) started from `register_middlewares()`.
+
+**Deliberately not gated behind `fetchUpstream`**, unlike every other upstream
+call this plugin makes. `fetchUpstream` governs whether _this plugin_ verifies
+SLSA attestations -- an opt-in, narrower feature. The registry signature this
+key relay supports is already being relayed unconditionally by Verdaccio's own
+core proxying, with or without `fetchUpstream`. Gating the key relay on
+`fetchUpstream` (default `false`) would mean the signature keeps flowing through
+by default while the corresponding key never does -- reproducing the exact
+`EMISSINGSIGNATUREKEY` failure above for every proxied package, on the default
+config. This is a narrower, different kind of always-on network call than
+`fetchUpstream`'s own documented promise ("never contacts registry.npmjs.org
+directly unless explicitly opted into") covers -- it only ever fetches
+`/-/npm/v1/keys` itself, nothing else, from uplinks this deployment is already
+configured to proxy from for ordinary installs.
+
+A key already known with identical contents is neither re-persisted nor
+re-counted as a change -- upstream signing keys rotate on the order of months to
+years, so in the ordinary case a refresh cycle past the first is a no-op. A
+fetch failure for one uplink never prevents another uplink's keys from being
+relayed.
+
+**Storage**: `storage.localStorage` has no listing/enumeration capability at all
+(see
+[Why `storage.localStorage`, not `storage` directly](#why-storagelocalstorage-not-storage-directly)
+above), so there's no way to ask "what upstream keys have I already stored"
+other than tracking that list explicitly -- one small index object
+(`{keyids: [...]}`) alongside one object per relayed key, named by a sanitized
+encoding of its own `keyid`. Both live under a dedicated, reserved storage
+namespace (`.verdaccio-attestations-registry-keys`) rather than a real package
+name -- deliberately an invalid, unpublishable npm package name (npm itself
+rejects a name starting with `.`), so no publish, by anyone with publish rights,
+could ever collide with or overwrite this plugin's own key storage.
+
+**Warm start**: on `register_middlewares()`, the in-memory cache is populated
+from whatever's already persisted before the first live refresh cycle even runs,
+so `GET /-/npm/v1/keys` has real answers immediately after a pod restart rather
+than an empty list until the first fetch completes.
+
+### Registry-signing a local publish
+
+`sigstore.signingKeys` (see [Full config](#full-config) above) configures one or
+more ECDSA P-256 signing keys this deployment owns, each provisioned the same
+way any other TLS secret in this org's Kubernetes deployments is: a
+cert-manager-managed `kubernetes.io/tls` Secret, mounted as a directory
+containing `tls.crt`/`tls.key`. Multiple entries are supported specifically so a
+key rotation can add a new key alongside an old one, rather than requiring an
+atomic swap -- both remain valid, both get served at `GET /-/npm/v1/keys`, until
+the old secret is actually removed from config.
+
+**Generating a key/cert pair for local development or testing** (an operator's
+real deployment should provision this the same way as any other TLS secret, via
+cert-manager -- this is for anyone who needs a standalone pair without a
+cluster, e.g. running this plugin locally):
+
+```sh
+openssl ecparam -name prime256v1 -genkey -noout -out tls.key
+openssl req -new -x509 -key tls.key -out tls.crt -days 3650 -subj "/CN=verdaccio-attestations-signing-key"
+```
+
+Only the curve (`prime256v1`, i.e. P-256) and key type (EC) matter to this
+plugin -- the certificate's subject, validity window (beyond a real `expires`),
+and issuer are never checked against anything; the certificate here exists only
+to carry the public key and a validity end date (surfaced as `expires` in the
+served `publicKeyEntry`), not to establish any identity the way a
+Sigstore/Fulcio certificate does.
+
+**When signing actually happens**: only during
+[publish-time interception](#publish-time-interception), and only when **both**
+`sigstore.signingKeys` is configured **and** `sigstore.trustedPublishers` is
+configured _and matched_ for that specific publish -- not merely "the
+attestation verified". A signature that verified with `trustedPublishers` left
+unconfigured (so no identity was actually checked) proves the tarball came from
+_some_ Sigstore-authenticated build, not that it came from a publisher this
+deployment actually trusts -- registry- signing that with our own key would let
+a downstream `npm audit signatures` treat it as equally trustworthy as a real
+`trustedPublishers` match, which it isn't. `sigstore.signingKeys` configured
+with `sigstore.trustedPublishers` left empty therefore signs nothing, ever --
+the same permissive-by-default posture this plugin's other opt-in features
+already have.
+
+The signed message is `<name>@<version>:<dist.integrity>` (the exact template
+real npm/pacote signs and verifies against -- confirmed directly against
+`pacote`'s own verification source -- using the raw SRI-format integrity string,
+e.g. `sha512-...`, not a hex digest), producing
+`dist.signatures: [{keyid, sig}, ...]`, one entry per configured signing key,
+injected into the same version metadata `dist.attestations` already is.
+
+**Deliberately not offered for a proxied, third-party package.** Only a local
+publish's own freshly-computed `dist.integrity` is ever signed with our own key
+-- re-signing an upstream package's own already-relayed content was considered
+and rejected: it would require re-deriving a signature over content this plugin
+doesn't control end-to-end (a `block`/`allow` filter or some other plugin could
+still mutate the packument after the fact), and would carry a different, weaker
+semantic meaning for a package with no `trustedPublishers` identity vetting
+behind it at all -- see
+[Deliberately not offered for a proxied, third-party package](#deliberately-not-offered-for-a-proxied-third-party-package)
+above for the identical reasoning already established for identity-pinning.
+
 ## Storage design: one object per package@version
 
 Exactly **one** stored object per package version -- not a separate marker file
@@ -548,7 +707,10 @@ version-range scoping for `block`/`allow` rules, and sorting substitution
 candidates for `strategy: replace`. `npm-package-arg` -- builds the purl an
 attestation subject's name is checked against. `ssri` -- parses `dist.integrity`
 into the hex digest an attestation subject's digest is checked against.
-`node-fetch` -- upstream requests, only ever made when `fetchUpstream: true`.
+`node-fetch` -- upstream requests: attestation fetches only ever made when
+`fetchUpstream: true`, plus the
+[upstream registry key relay](#upstream-key-relay)'s own `GET /-/npm/v1/keys`
+requests, which are unconditional (see that section for why).
 `https-proxy-agent` -- proxy support for those requests (see
 [Proxy support](#proxy-support) above), unused without `auth.config.https_proxy`
 configured. `body-parser` -- parses the publish request body ahead of
@@ -560,3 +722,8 @@ down into `filter_metadata()` and the attestations route handler (neither has
 `req` access at all) -- no external package, but worth calling out since it's
 load-bearing for the
 [per-request fetchUpstream override](#per-request-override-verdaccio-offline-enforcer-identities-never-trigger-a-live-fetch).
+Node's built-in `node:crypto` -- all of `keys.js`'s own cryptography (loading an
+ECDSA P-256 key/cert pair, computing a keyid, signing a registry signature) --
+see [Registry signatures](#registry-signatures) above; no external package
+needed since Node's own `crypto` module already covers everything that mechanism
+requires.
