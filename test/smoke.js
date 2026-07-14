@@ -2581,6 +2581,143 @@ async function main() {
     },
   );
 
+  // --- body-buffering middleware (workaround for verdaccio/verdaccio#1912) ---
+
+  await check(
+    "buffering middleware: a PUT with a JSON content-type gets req.body/req._body populated, before this plugin's own publish-intercepting middleware even runs",
+    async () => {
+      const plugin = makeAttestations({});
+      const handlers = [];
+      plugin.register_middlewares(
+        {use: fn => handlers.push(fn), get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      // handlers[0] is the offline-restriction context middleware, [1] is
+      // this new buffering one, [2] is the existing publish-intercepting
+      // middleware -- run just the first two here.
+      const [, bufferHandler] = handlers;
+
+      const {Readable} = require('node:stream');
+      const req = new Readable({read() {}});
+      req.method = 'PUT';
+      req.headers = {'content-type': 'application/json'};
+      const payload = {versions: {'1.0.0': {version: '1.0.0'}}};
+      process.nextTick(() => {
+        req.push(JSON.stringify(payload));
+        req.push(null);
+      });
+
+      await new Promise((resolve, reject) => {
+        bufferHandler(req, {}, err => (err ? reject(err) : resolve()));
+      });
+      assert.equal(req._body, true);
+      assert.deepEqual(req.body, payload);
+    },
+  );
+
+  await check(
+    'buffering middleware: skips entirely if an earlier middleware already populated req._body',
+    async () => {
+      const plugin = makeAttestations({});
+      const handlers = [];
+      plugin.register_middlewares(
+        {use: fn => handlers.push(fn), get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(makeFakeStorage()),
+      );
+      const [, bufferHandler] = handlers;
+
+      const {Readable} = require('node:stream');
+      const req = new Readable({read() {}});
+      req.method = 'PUT';
+      req.headers = {'content-type': 'application/json'};
+      req._body = true;
+      req.body = {alreadySetByAnotherPlugin: true};
+      process.nextTick(() => {
+        req.push('{"versions":{}}');
+        req.push(null);
+      });
+
+      await new Promise((resolve, reject) => {
+        bufferHandler(req, {}, err => (err ? reject(err) : resolve()));
+      });
+      assert.deepEqual(req.body, {alreadySetByAnotherPlugin: true});
+    },
+  );
+
+  await check(
+    'end-to-end: the buffering middleware prevents the exact stream-draining race a real, unmodified Verdaccio log.js causes, when this plugin is the first (or only) one reading the body',
+    async () => {
+      // Mirrors @verdaccio/middleware's own log.js exactly (confirmed
+      // directly against its real, installed source) -- see
+      // verdaccio-security-filter's identical test for the full analysis
+      // of why an additional, unrelated async plugin ahead of this one is
+      // deliberately not also simulated here (that combination is
+      // unfixable by any single plugin; verdaccio-oidc-auth's own copy of
+      // this same fix is what protects that case, by buffering before its
+      // own async work rather than after).
+      function verdaccioLogMiddlewareMirror(req, res, next) {
+        let bytesin = 0;
+        req.on('data', chunk => {
+          bytesin += chunk.length;
+        });
+        next();
+      }
+
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+      const handlers = [];
+      plugin.register_middlewares(
+        {use: fn => handlers.push(fn), get() {}},
+        {config: {}},
+        wrapAsTopLevelStorage(storage),
+      );
+      const allHandlers = [verdaccioLogMiddlewareMirror, ...handlers];
+
+      const app = express();
+      app.use((req, res, next) => {
+        let index = 0;
+        const dispatch = err => {
+          if (err) return next(err);
+          const handler = allHandlers[index++];
+          if (!handler) return next();
+          handler(req, res, dispatch);
+        };
+        dispatch();
+      });
+      app.put('/:package', (req, res) => {
+        res.status(201).json({ok: true, versions: !!req.body?.versions});
+      });
+
+      const server = await new Promise(resolve => {
+        const s = app.listen(0, () => resolve(s));
+      });
+      try {
+        const port = server.address().port;
+        const payload = JSON.stringify({
+          versions: {'1.0.0': {version: '1.0.0'}},
+          filler: 'x'.repeat(75000), // realistic publish-with-provenance size
+        });
+
+        const response = await fetch(`http://localhost:${port}/pkg`, {
+          method: 'PUT',
+          headers: {'content-type': 'application/json'},
+          body: payload,
+        });
+        const json = await response.json();
+        assert.equal(
+          response.status,
+          201,
+          `expected the publish to succeed despite log.js's own listener; got: ${JSON.stringify(json)}`,
+        );
+        assert.ok(json.versions);
+      } finally {
+        server.close();
+      }
+    },
+  );
+
   console.log(results.join('\n'));
   console.log(`\n${passed} check(s) passed.`);
   if (results.some(r => r.startsWith('FAIL'))) process.exitCode = 1;

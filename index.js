@@ -1003,6 +1003,52 @@ class Attestations {
       );
     });
 
+    // Workaround for verdaccio/verdaccio#1912 (reported 2020, unfixed in
+    // the currently-published @verdaccio/middleware -- see
+    // verdaccio-oidc-auth's own identical comment on its own copy of this
+    // fix for the full analysis, and verdaccio-security-filter's for why
+    // this must not depend on any specific other plugin, including
+    // verdaccio-oidc-auth, being installed). @verdaccio/middleware's own
+    // access-log middleware attaches req.on('data', ...) unconditionally
+    // to count bytes, switching the request stream into Node's flowing
+    // mode immediately on every request -- any async middleware ahead of
+    // this plugin's own body-parser below (this deployment cannot assume
+    // any specific one is even installed) opens a window where the stream
+    // fully drains via that listener alone before this plugin's own
+    // body-parser (or Verdaccio core's own) ever attaches its own. Uses
+    // body-parser's own pre-existing req.body/req._body contract, not a
+    // plugin-specific signal, so this both protects itself when it's the
+    // first (or only) plugin reading the body, and correctly reuses
+    // whatever an earlier plugin (verdaccio-security-filter,
+    // verdaccio-oidc-auth, or any third-party one following the same
+    // contract) already populated.
+    app.use((req, res, next) => {
+      if (req._body) return next();
+      const contentEncoding = (req.headers['content-encoding'] || '')
+        .trim()
+        .toLowerCase();
+      if (
+        req.method !== 'PUT' ||
+        !/json/i.test(req.headers['content-type'] || '') ||
+        (contentEncoding !== '' && contentEncoding !== 'identity')
+      ) {
+        return next();
+      }
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        try {
+          req.body = raw.length > 0 ? JSON.parse(raw.toString('utf8')) : {};
+        } catch (err) {
+          return next(err);
+        }
+        req._body = true;
+        next();
+      });
+      req.on('error', err => next(err));
+    });
+
     app.use((req, res, next) => {
       if (req.method !== 'PUT') return next();
       // This middleware runs before Verdaccio's own router (which is what
@@ -1018,7 +1064,26 @@ class Attestations {
       const packageName = decodeURIComponent(segments[0]);
 
       this._parseJsonBody(req, res, err => {
-        if (err) return next(err);
+        if (err) {
+          // raw-body's own error carries expected/received/type properties
+          // that never otherwise reach any log line (Verdaccio's own
+          // request logger only captures err.message) -- surfacing them
+          // here is the only way to see the byte-count discrepancy behind
+          // a "request size did not match content length" failure, should
+          // one ever happen again despite the buffering middleware above.
+          this.logger.error(
+            {
+              pkg: packageName,
+              errType: err.type,
+              errMessage: err.message,
+              expected: err.expected,
+              received: err.received,
+              length: err.length,
+            },
+            'verdaccio-attestations: publish body parse failed (@{errType}: @{errMessage}, expected=@{expected} received=@{received})',
+          );
+          return next(err);
+        }
         this._interceptPublish(req, res, packageName).finally(() => next());
       });
     });
