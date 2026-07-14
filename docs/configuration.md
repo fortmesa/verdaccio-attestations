@@ -13,6 +13,20 @@ filters:
     block: [] # optional enforcement list -- see "Matching: block/allow" below
     allow: [] # optional -- bypasses block entirely for a matching package/version
     sigstore: {} # optional -- passed through verbatim as sigstore.verify()'s options argument
+      # trustedPublishers: [] # optional -- see "Verification" below. ONLY
+      # applied to a locally-published package's own .sigstore attachment,
+      # never to a proxied third-party one. Each entry: {issuer?,
+      # subjectAlternativeName?} -- at least one required, both allowed.
+      # subjectAlternativeName is a real minimatch pattern (dot: true, so
+      # "**"/"*" cross a leading-"." path segment like GitHub Actions' own
+      # "/.github/workflows/" -- confirmed necessary against a real bundle,
+      # not every glob library's default) matched against the verified
+      # certificate's own identity -- not GitHub-specific, works for any
+      # Sigstore-compatible issuer's own SAN shape:
+      #   trustedPublishers:
+      #     - subjectAlternativeName: 'https://github.com/fortmesa/verdaccio-attestations/**'
+      #     - issuer: 'https://token.actions.githubusercontent.com'
+      #       subjectAlternativeName: 'https://github.com/fortmesa/*/**'
 
 middlewares:
   '@fortmesa/verdaccio-attestations': {} # required -- see "Why middlewares is not optional" below
@@ -118,12 +132,23 @@ fetch.
 
 **With `fetchUpstream: true`**: an unresolved, gated version's real verification
 (a `GET` to the real registry's `/-/npm/v1/attestations/<name>@<version>`, then
-cryptographic verification -- see [Verification](#verification) below) runs in
-the background (see
-[Fast-tier / background verification](#fast-tier--background-verification)
+cryptographic verification -- see [Verification](#verification) below) is
+awaited directly by the request that needs it, bounded by a 5-second timeout
+(see
+[Fast-tier verification, awaited in full when it isn't already known](#fast-tier-verification-awaited-in-full-when-it-isnt-already-known)
 below); a `GET` to the attestations route for a package with nothing stored
 locally relays the raw upstream response instead of 404ing -- **for the
 requesting identity's own request**, see below.
+
+**Turning this on means trusting exactly what [Verification](#verification)
+below checks, no more** -- a cryptographically valid Sigstore signature, backed
+by a real transparency-log entry, over the exact package@version and tarball
+being installed. It does **not** mean the signer's identity was checked against
+the package's actual legitimate publisher -- see that section's "Known
+limitation" for why that specifically can't be closed for a proxied, third-party
+package (as opposed to a package published locally to this registry, where the
+operator's own OIDC config already independently establishes who's trusted to
+publish what).
 
 The two "not yet known" outcomes -- missing `dist.integrity` to verify against,
 and `fetchUpstream` being disabled or effectively disabled for this request --
@@ -177,37 +202,39 @@ request/identity to evaluate at all -- `fetchUpstream` is treated as `false`
 there regardless of config, the same fail-closed default `enforceForAnonymous`
 already establishes for an anonymous HTTP request.
 
-## Fast-tier / background verification
+## Fast-tier verification, awaited in full when it isn't already known
 
 Checking one version's attestation status never blocks on network I/O for
-another. `filter_metadata()` only ever awaits a strictly non-network resolution
-tier per gated version:
+another version -- `filter_metadata()` resolves every gated version concurrently
+(`Promise.all`), so version `A` never delays version `B`. Two tiers, evaluated
+per version:
 
-1. **Peek** -- the packument's own `dist.attestations.verified` (already
-   embedded, e.g. from a local publish this same process handled), or an
-   in-memory cache hit from a verdict this process already resolved.
-2. **Fast** -- peek, plus (on a cache miss) exactly one persisted-storage read
-   of the object described in
+1. **Fast (no network)** -- the packument's own `dist.attestations.verified`
+   (already embedded, e.g. from a local publish this same process handled), an
+   in-memory cache hit from a verdict this process already resolved, or (on a
+   cache miss) exactly one persisted-storage read of the object described in
    [Storage design](#storage-design-one-object-per-packageversion) below --
-   still no network, no cryptographic verification, cheap enough to pay on every
-   metadata read.
+   cheap enough to pay on every metadata read.
+2. **Real** -- for any version the fast tier has no answer for: the upstream
+   fetch `fetchUpstream` gates (bounded by a 5-second timeout --
+   `UPSTREAM_FETCH_TIMEOUT_MS` in `index.js` -- so a slow/unresponsive upstream
+   can't turn a metadata read into a hang instead of a bounded wait), plus
+   actual `sigstore.verify()` cryptographic work. `filter_metadata()` awaits
+   this directly rather than returning a fail-closed answer immediately and
+   resolving it in the background: a never-before-seen version's _first_ read
+   used to be guaranteed wrong (blocked, even for a package that would have
+   verified cleanly) purely because nothing had checked it yet -- a real,
+   confusing false negative for whichever client happened to be first, not just
+   a one-time cold-cache cost.
 
-A version with no answer at either tier is **failed closed immediately**
-(consistent with "`block` means require proof; no proof yet available also means
-no") and the real resolution -- which may include the upstream fetch
-`fetchUpstream` gates, plus actual `sigstore.verify()` cryptographic work -- is
-kicked off as an untracked-by-the-request background `Promise`. A subsequent
-metadata read for the same version sees the real verdict once that background
-work finishes, without ever having blocked the request that triggered it.
-Because each gated version resolves independently via `Promise.all`, and each
-unresolved one's background work is independent too, none of this serializes
-across a package's versions -- resolving version `A` never delays version `B`.
+Once resolved (either tier), the verdict is cached in-memory and persisted, so a
+second read of the same version never repeats the real resolution.
 
-The plugin exposes `whenAllBackgroundWorkSettles()` for exactly one purpose:
-letting a test deterministically await every in-flight background verification
-(including ones triggered by others already in flight) instead of guessing a
-timeout for `sigstore.verify()`'s own, sometimes network-bound, work to finish.
-Real request handling never calls it.
+The plugin exposes `whenAllBackgroundWorkSettles()` for the _other_ background
+work it still does -- `_interceptPublish()`'s deferred storage write after a
+local publish (see [Publish-time interception](#publish-time-interception)
+below) -- letting a test deterministically await it instead of guessing a
+timeout. Real request handling never calls it.
 
 ## Verification
 
@@ -233,6 +260,58 @@ down whichever caller is checking it:
    Sigstore's public trust root, not an existence-only check. `opts` is whatever
    `sigstore:` is configured to in `filters:` (see [Full config](#full-config)
    above), passed straight through.
+
+**Signer identity: checkable for a locally-published package, not for a proxied
+one.** `sigstore.verify()` alone only confirms the bundle is a cryptographically
+genuine Sigstore signature backed by a real Rekor transparency-log entry -- with
+no `certificateIdentityEmail`/
+`certificateIdentityURI`/`certificateIssuer`/`certificateOIDs` set under
+`sigstore:` (the default, `{}`), it accepts a valid signature from _any_
+Sigstore identity, not specifically the package's own legitimate publisher.
+
+For a package published **locally** (`_interceptPublish()`,
+[Publish-time interception](#publish-time-interception) below),
+`sigstore.trustedPublishers` closes this: a small list of
+`{issuer?, subjectAlternativeName?}` entries (see [Full config](#full-config)
+above) that the verified certificate's own identity must match at least one of,
+checked _after_ `sigstore.verify()` succeeds (since `sigstore.verify()` itself
+only supports one static identity constraint, not "any of N" -- this plugin
+checks the returned, already-cryptographically-verified `Signer`'s identity
+against the whole list instead). This is meaningful specifically because the
+operator already has an independent, trusted answer to "who's allowed to publish
+this" -- the same small set of repos already enumerated in
+`verdaccio-oidc-auth`'s own `allow:` list.
+
+**Deliberately not offered for a proxied, third-party package** -- there's no
+equivalent independent answer for an arbitrary npm package this registry merely
+proxies:
+
+- **No independent source of truth.** There's no registry-maintainable mapping
+  of "the legitimate GitHub repo for every third-party npm package." A field
+  embedded in the very packument being verified (e.g. `repository.url`) isn't
+  independent of it -- an attacker who has already compromised a package's real
+  publish credentials controls that field too, so checking identity against it
+  would be circular, not a security boundary.
+- **No stable identity to pin to, even in principle.** Fulcio certificates are
+  short-lived (~10 minutes) and minted fresh per signing operation, tied to that
+  one ephemeral build's exact OIDC claims -- there's no persistent, checkable
+  "this is always package X's identity" the way a traditional long-lived
+  code-signing certificate would provide.
+- **The upstream registry contributes no opinion of its own either** --
+  confirmed directly against a real captured response
+  (`test/fixtures/actions-core-3.0.1-attestations.json`):
+  `GET /-/npm/v1/attestations/...` returns only `predicateType`/`bundle`/
+  `signedAccessSignatureUrl`, no `verified`/`valid` field anywhere. It's a plain
+  relay of whatever was attached at publish time -- every check above is this
+  plugin's own, entirely independent of anything npm's registry asserts.
+
+What `verified: true` therefore actually proves, for a proxied package: a real,
+OIDC-authenticated Sigstore identity -- traceable, permanently, in a public
+transparency log -- attested that this exact tarball came from some automated
+build pipeline. It does not prove that identity is the package's legitimate
+maintainer. That's the real ceiling of what SLSA provenance can prove for an
+arbitrary third-party package with no independently-trusted identity to check
+against, not a gap specific to this plugin's own implementation.
 
 A `GET /-/npm/v1/attestations/...`-shaped response can carry more than one
 attestation (real npm data for an attested package lists the keyed publish

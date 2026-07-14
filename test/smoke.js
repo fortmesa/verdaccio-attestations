@@ -11,7 +11,11 @@ const {
   requestContext,
   __resetSharedStateForTests,
 } = require('../index.js');
-const {verifyBundle, verifyAttestationsResponse} = require('../verify.js');
+const {
+  verifyBundle,
+  verifyAttestationsResponse,
+  matchesTrustedPublisher,
+} = require('../verify.js');
 
 // Simulates "a real, non-offline-restricted request came in" around a
 // direct method call (filter_metadata/_handleGetAttestations/etc.) that
@@ -243,6 +247,231 @@ async function main() {
     },
   );
 
+  // --- trustedPublishers: identity pinning for locally-published packages ---
+  // Real bundle's certificate SAN (confirmed via node:crypto's X509Certificate
+  // and the real sigstore.verify() call itself, independently):
+  // "https://github.com/actions/toolkit/.github/workflows/releases.yml@refs/heads/main"
+  const REAL_SAN =
+    'https://github.com/actions/toolkit/.github/workflows/releases.yml@refs/heads/main';
+  const REAL_ISSUER = 'https://token.actions.githubusercontent.com';
+
+  await check(
+    'verifyBundle succeeds when trustedPublishers is configured and the certificate matches one entry',
+    async () => {
+      const result = await verifyBundle(REAL_PKG, realProvenanceBundle(), {}, [
+        {subjectAlternativeName: 'https://github.com/actions/toolkit/**'},
+      ]);
+      assert.equal(result.verified, true);
+    },
+  );
+
+  await check(
+    'verifyBundle fails when trustedPublishers is configured and the certificate matches no entry, even though the signature is genuinely valid',
+    async () => {
+      const result = await verifyBundle(REAL_PKG, realProvenanceBundle(), {}, [
+        {
+          subjectAlternativeName:
+            'https://github.com/someone-else/other-repo/**',
+        },
+      ]);
+      assert.equal(result.verified, false);
+      assert.match(result.reason, /not in the trusted publisher list/);
+    },
+  );
+
+  await check(
+    'verifyBundle: an issuer-only trustedPublishers entry matches on issuer alone',
+    async () => {
+      const result = await verifyBundle(REAL_PKG, realProvenanceBundle(), {}, [
+        {issuer: REAL_ISSUER},
+      ]);
+      assert.equal(result.verified, true);
+    },
+  );
+
+  await check(
+    'verifyBundle: an entry with both issuer and subjectAlternativeName requires both to match',
+    async () => {
+      const wrongIssuer = await verifyBundle(
+        REAL_PKG,
+        realProvenanceBundle(),
+        {},
+        [
+          {
+            issuer: 'https://gitlab.example.com',
+            subjectAlternativeName: 'https://github.com/actions/toolkit/**',
+          },
+        ],
+      );
+      assert.equal(wrongIssuer.verified, false);
+
+      const bothMatch = await verifyBundle(
+        REAL_PKG,
+        realProvenanceBundle(),
+        {},
+        [
+          {
+            issuer: REAL_ISSUER,
+            subjectAlternativeName: 'https://github.com/actions/toolkit/**',
+          },
+        ],
+      );
+      assert.equal(bothMatch.verified, true);
+    },
+  );
+
+  await check(
+    'matchesTrustedPublisher: not GitHub-specific -- a non-GitHub-shaped subjectAlternativeName pattern works the same way',
+    () => {
+      const gitlabIdentity = {
+        subjectAlternativeName:
+          'https://gitlab.example.com/some-group/some-project//path/to/.gitlab-ci.yml@refs/heads/main',
+        extensions: {issuer: 'https://gitlab.example.com'},
+      };
+      assert.equal(
+        matchesTrustedPublisher(gitlabIdentity, [
+          {
+            subjectAlternativeName:
+              'https://gitlab.example.com/some-group/some-project/**',
+          },
+        ]),
+        true,
+      );
+      assert.equal(
+        matchesTrustedPublisher(gitlabIdentity, [
+          {subjectAlternativeName: 'https://github.com/**'},
+        ]),
+        false,
+      );
+    },
+  );
+
+  await check(
+    'matchesTrustedPublisher: no identity on the certificate at all never matches',
+    () => {
+      assert.equal(
+        matchesTrustedPublisher(undefined, [{subjectAlternativeName: '**'}]),
+        false,
+      );
+    },
+  );
+
+  await check(
+    'construction throws loud on a malformed sigstore.trustedPublishers entry',
+    () => {
+      assert.throws(
+        () =>
+          makeAttestations({
+            sigstore: {trustedPublishers: [{unknownKey: 'x'}]},
+          }),
+        /unknown key/,
+      );
+      assert.throws(
+        () => makeAttestations({sigstore: {trustedPublishers: [{}]}}),
+        /must set at least one of/,
+      );
+      assert.throws(
+        () =>
+          makeAttestations({
+            sigstore: {trustedPublishers: ['not-an-object']},
+          }),
+        /must be an object/,
+      );
+    },
+  );
+
+  await check(
+    'end-to-end: a local publish is verified when its certificate matches sigstore.trustedPublishers',
+    async () => {
+      const plugin = makeAttestations({
+        sigstore: {
+          trustedPublishers: [
+            {subjectAlternativeName: 'https://github.com/actions/toolkit/**'},
+          ],
+        },
+      });
+      const storage = makeFakeStorage();
+      const bundle = realProvenanceBundle();
+      const body = {
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+        _attachments: {
+          '@actions/core-3.0.1.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes();
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.equal(body.versions['3.0.1'].dist.attestations.verified, true);
+    },
+  );
+
+  await check(
+    'end-to-end: a local publish is rejected-as-unverified when its certificate does not match sigstore.trustedPublishers, despite a genuinely valid signature',
+    async () => {
+      const plugin = makeAttestations({
+        sigstore: {
+          trustedPublishers: [
+            {subjectAlternativeName: 'https://github.com/someone-else/**'},
+          ],
+        },
+      });
+      const bundle = realProvenanceBundle();
+      const body = {
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+        _attachments: {
+          '@actions/core-3.0.1.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes();
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.equal(body.versions['3.0.1'].dist.attestations.verified, false);
+      assert.match(
+        body.versions['3.0.1'].dist.attestations.reason,
+        /not in the trusted publisher list/,
+      );
+    },
+  );
+
+  await check(
+    'unconfigured (default empty) sigstore.trustedPublishers means no identity check at all -- same as before this feature existed',
+    async () => {
+      const plugin = makeAttestations({});
+      const bundle = realProvenanceBundle();
+      const body = {
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+        _attachments: {
+          '@actions/core-3.0.1.sigstore': {
+            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+          },
+        },
+      };
+      const req = makeFakeReq(body);
+      const res = makeFakeRes();
+      await plugin._interceptPublish(req, res, '@actions/core');
+      res._triggerFinish();
+      await plugin.whenAllBackgroundWorkSettles();
+
+      assert.equal(body.versions['3.0.1'].dist.attestations.verified, true);
+    },
+  );
+
   await check(
     'verifyAttestationsResponse finds and returns the provenance bundle, not the keyed one that comes first',
     async () => {
@@ -418,7 +647,7 @@ async function main() {
   );
 
   await check(
-    'a never-before-seen version fails closed IMMEDIATELY (no network wait) and resolves for real in the background',
+    'a never-before-seen version is resolved for real on the very first read, not wrongly blocked while a background check catches up',
     async () => {
       let fetchCalls = 0;
       const plugin = makeAttestations(
@@ -439,18 +668,43 @@ async function main() {
       await asOnlineRequest(async () => {
         const first = await plugin.filter_metadata(structuredClone(pkg));
         assert.ok(
-          !('3.0.1' in first.versions),
-          'must be blocked on the very first read -- there is no way to have a real verdict yet without waiting on the network',
-        );
-
-        await plugin.whenAllBackgroundWorkSettles();
-
-        const second = await plugin.filter_metadata(structuredClone(pkg));
-        assert.ok(
-          '3.0.1' in second.versions,
-          'the background resolution should have verified it by now',
+          '3.0.1' in first.versions,
+          'the very first read must already reflect the real verdict -- ' +
+            'a version that would verify cleanly must never be wrongly ' +
+            'blocked just because nothing had checked it yet',
         );
         assert.equal(fetchCalls, 1);
+
+        // A second read must not repeat the upstream fetch -- the fast
+        // (cache/storage) tier now has an answer.
+        const second = await plugin.filter_metadata(structuredClone(pkg));
+        assert.ok('3.0.1' in second.versions);
+        assert.equal(fetchCalls, 1);
+      });
+    },
+  );
+
+  await check(
+    'a never-before-seen version that fails to verify is blocked on the very first read, not deferred',
+    async () => {
+      const plugin = makeAttestations(
+        {block: ['**'], fetchUpstream: true},
+        {
+          fetch: async () => ({
+            ok: true,
+            json: async () => ({attestations: []}),
+          }),
+        },
+      );
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
+
+      const pkg = makePackageInfo('some-pkg', {
+        '1.0.0': {version: '1.0.0', dist: {integrity: 'sha512-a'}},
+      });
+
+      await asOnlineRequest(async () => {
+        const result = await plugin.filter_metadata(structuredClone(pkg));
+        assert.ok(!('1.0.0' in result.versions));
       });
     },
   );
@@ -487,6 +741,71 @@ async function main() {
         callOrder.slice(0, 2).map(c => c.split(':')[0]),
         ['start', 'start'],
       );
+    },
+  );
+
+  await check(
+    "the upstream attestation fetch targets this package's own configured proxy uplink, not a hardcoded registry",
+    async () => {
+      let fetchedUrl;
+      const plugin = makeAttestations(
+        {block: ['**'], fetchUpstream: true},
+        {
+          fetch: async url => {
+            fetchedUrl = url;
+            return {ok: true, json: async () => ({attestations: []})};
+          },
+        },
+      );
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
+      plugin._auth = {
+        config: {
+          uplinks: {
+            'internal-mirror': {
+              url: 'https://npm-mirror.internal.example.com/',
+            },
+          },
+          getMatchedPackagesSpec: name =>
+            name === 'some-pkg' ? {proxy: 'internal-mirror'} : undefined,
+        },
+      };
+
+      const pkg = makePackageInfo('some-pkg', {
+        '1.0.0': {version: '1.0.0', dist: {integrity: 'sha512-a'}},
+      });
+      await asOnlineRequest(() => plugin.filter_metadata(structuredClone(pkg)));
+
+      assert.ok(
+        fetchedUrl.startsWith('https://npm-mirror.internal.example.com'),
+        `expected the configured uplink's own host, got: ${fetchedUrl}`,
+      );
+    },
+  );
+
+  await check(
+    'falls back to the real npm registry only when a package has no proxy configured at all',
+    async () => {
+      let fetchedUrl;
+      const plugin = makeAttestations(
+        {block: ['**'], fetchUpstream: true},
+        {
+          fetch: async url => {
+            fetchedUrl = url;
+            return {ok: true, json: async () => ({attestations: []})};
+          },
+        },
+      );
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
+      plugin._auth = {
+        config: {uplinks: {}, getMatchedPackagesSpec: () => undefined},
+      };
+
+      const pkg = makePackageInfo('unconfigured-pkg', {
+        '1.0.0': {version: '1.0.0', dist: {integrity: 'sha512-a'}},
+      });
+      await asOnlineRequest(() => plugin.filter_metadata(structuredClone(pkg)));
+
+      assert.ok(fetchedUrl.startsWith('https://registry.npmjs.org'));
     },
   );
 
@@ -1108,7 +1427,7 @@ async function main() {
         end() {},
       };
       await plugin._handleGetAttestations(
-        {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
+        {params: {pkgAtVersion: '@actions/core@3.0.1'}},
         res,
       );
       assert.equal(statusCode, 200);
@@ -1134,7 +1453,7 @@ async function main() {
         end() {},
       };
       await plugin._handleGetAttestations(
-        {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
+        {params: {pkgAtVersion: '@actions/core@3.0.1'}},
         res,
       );
       assert.equal(statusCode, 404);
@@ -1172,7 +1491,7 @@ async function main() {
       };
       await asOnlineRequest(() =>
         plugin._handleGetAttestations(
-          {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
+          {params: {pkgAtVersion: '@actions/core@3.0.1'}},
           res,
         ),
       );
@@ -1221,7 +1540,7 @@ async function main() {
       };
       await requestContext.run({offlineRestricted: true}, () =>
         plugin._handleGetAttestations(
-          {params: {pkgAtVersion: '@actions%2Fcore@3.0.1'}},
+          {params: {pkgAtVersion: '@actions/core@3.0.1'}},
           res,
         ),
       );
@@ -1256,6 +1575,54 @@ async function main() {
         res,
       );
       assert.equal(statusCode, 404);
+    },
+  );
+
+  await check(
+    'a name/version shaped like a storage-key escape attempt is rejected with 400, not passed to the storage backend',
+    async () => {
+      const plugin = makeAttestations({}, {fetch: makeFakeFetch({})}); // any storage/fetch call should throw
+      plugin._storage = wrapAsTopLevelStorage(makeFakeStorage());
+
+      async function statusFor(pkgAtVersion) {
+        let statusCode;
+        const res = {
+          status(code) {
+            statusCode = code;
+            return this;
+          },
+          json() {
+            return this;
+          },
+          end() {},
+        };
+        await plugin._handleGetAttestations({params: {pkgAtVersion}}, res);
+        return statusCode;
+      }
+
+      // Express's own router only ever decodes req.params once (verified
+      // against the installed express/router package) -- this exercises
+      // exactly the value this method actually receives, not a raw URL.
+      assert.equal(
+        await statusFor('../../../etc/passwd@1.0.0'),
+        400,
+        'a ".." path segment in the name must not reach the storage layer',
+      );
+      assert.equal(
+        await statusFor('left-pad@../../etc/passwd'),
+        400,
+        'a ".." path segment in the version must not reach the storage layer',
+      );
+      assert.equal(
+        await statusFor('left-pad@1.0.0/../../etc/passwd'),
+        400,
+        'a "/" in the version (not just "..") must also be rejected',
+      );
+      assert.equal(
+        await statusFor('@scope/nested/pkg@1.0.0'),
+        400,
+        'more than one "/" in the name must be rejected',
+      );
     },
   );
 
@@ -1529,8 +1896,10 @@ async function main() {
 
       await asOnlineRequest(async () => {
         const first = await plugin.filter_metadata(structuredClone(pkg));
-        assert.ok(!('3.0.1' in first.versions));
-        await plugin.whenAllBackgroundWorkSettles();
+        assert.ok(
+          '3.0.1' in first.versions,
+          'must resolve correctly on the very first read even with no persistent storage reachable',
+        );
 
         const second = await plugin.filter_metadata(structuredClone(pkg));
         assert.ok(

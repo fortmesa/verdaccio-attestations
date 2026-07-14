@@ -37,7 +37,18 @@ const PLUGIN_CONFIG_KEY = '@fortmesa/verdaccio-attestations';
 const OFFLINE_ENFORCER_CONFIG_KEY = '@fortmesa/verdaccio-offline-enforcer';
 
 const ATTESTATIONS_PATH_PREFIX = '/-/npm/v1/attestations/';
-const REAL_NPM_REGISTRY = 'https://registry.npmjs.org';
+// Only a fallback for a package with no proxy: configured at all -- see
+// _resolveUpstreamRegistryUrls() below for why this isn't used
+// unconditionally. Matches @verdaccio/config's own DEFAULT_REGISTRY
+// constant (confirmed against its source) -- the same default Verdaccio
+// itself falls back to, not a value invented here.
+const DEFAULT_UPSTREAM_REGISTRY = 'https://registry.npmjs.org';
+// filter_metadata() now awaits _resolveVerdict() directly for a
+// never-before-seen version instead of backgrounding it (see that
+// method's own comment on why) -- this bounds the one network call that
+// can add to a metadata read's latency, so a slow/unresponsive upstream
+// can't turn into a hung install instead of a (still fast) block.
+const UPSTREAM_FETCH_TIMEOUT_MS = 5000;
 
 // Carries the current request's offline-restriction decision from
 // register_middlewares() (real req access) down into filter_metadata() and
@@ -136,6 +147,48 @@ function compileRules(rules, source) {
   });
 }
 
+// Fail loud at startup on a malformed entry, not silently-matches-nothing
+// (or matches-everything) at publish time -- same principle compileRules()
+// above already applies to block:/allow:. Not GitHub-specific: each entry
+// is {issuer?, subjectAlternativeName?} (see verify.js's
+// matchesTrustedPublisher() for how these are checked against a verified
+// certificate's own identity), so any Sigstore-compatible OIDC issuer's
+// shape can be configured, not just GitHub Actions'.
+function compileTrustedPublishers(entries) {
+  return entries.map(entry => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(
+        `verdaccio-attestations: sigstore.trustedPublishers entry must be an object with 'issuer' and/or 'subjectAlternativeName': ${JSON.stringify(entry)}`,
+      );
+    }
+    const {issuer, subjectAlternativeName, ...rest} = entry;
+    if (Object.keys(rest).length > 0) {
+      throw new Error(
+        `verdaccio-attestations: sigstore.trustedPublishers entry has unknown key(s) ${Object.keys(rest).join(', ')}: ${JSON.stringify(entry)}`,
+      );
+    }
+    if (issuer === undefined && subjectAlternativeName === undefined) {
+      throw new Error(
+        `verdaccio-attestations: sigstore.trustedPublishers entry must set at least one of 'issuer'/'subjectAlternativeName': ${JSON.stringify(entry)}`,
+      );
+    }
+    if (issuer !== undefined && typeof issuer !== 'string') {
+      throw new Error(
+        `verdaccio-attestations: sigstore.trustedPublishers entry's 'issuer' must be a string: ${JSON.stringify(entry)}`,
+      );
+    }
+    if (
+      subjectAlternativeName !== undefined &&
+      typeof subjectAlternativeName !== 'string'
+    ) {
+      throw new Error(
+        `verdaccio-attestations: sigstore.trustedPublishers entry's 'subjectAlternativeName' must be a string: ${JSON.stringify(entry)}`,
+      );
+    }
+    return {issuer, subjectAlternativeName};
+  });
+}
+
 // Splits "<name>@<version>" (name may itself start with "@" for a scoped
 // package, e.g. "@actions/core@3.0.1") on the LAST "@" -- the only
 // unambiguous split point, since the name's own leading "@" (if scoped) is
@@ -146,6 +199,41 @@ function splitPkgAtVersion(pkgAtVersion) {
   return {name: pkgAtVersion.slice(0, at), version: pkgAtVersion.slice(at + 1)};
 }
 
+// Rejects anything that could let name/version escape a single logical
+// storage key/path segment once handed to attestationFilename() below --
+// checked here, in this plugin's own code, rather than trusted to whatever
+// storage backend (filesystem, S3, ...) happens to be configured
+// underneath: backends differ in whether/how they sanitize a key derived
+// from these values (the bundled filesystem backend happens to strip a
+// bare ".."/"." path segment itself, but that's that backend's own
+// behavior, not a contract this plugin can rely on for every backend it
+// might be paired with).
+function isSafePathSegment(value) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 214 &&
+    !/[\x00-\x1f]/.test(value) &&
+    !/(^|\/)\.\.($|\/)/.test(value)
+  );
+}
+
+// A package name may contain exactly one "/" (the scope separator, e.g.
+// "@scope/pkg") -- never zero-or-two-plus in any other shape, and never a
+// bare ".."/"." segment on either side of it.
+function isSafePackageName(name) {
+  if (!isSafePathSegment(name)) return false;
+  const segments = name.split('/');
+  if (segments.length > 2) return false;
+  if (segments.length === 2 && !segments[0].startsWith('@')) return false;
+  return true;
+}
+
+// A version string never legitimately contains a "/" at all.
+function isSafeVersion(version) {
+  return isSafePathSegment(version) && !version.includes('/');
+}
+
 // One file per package@version, alongside the tarball in the same
 // per-package storage location -- never a separate .sigstore file, see
 // _readStoredVerdict()/_storeVerdictAndBundle() for why: the verdict and
@@ -153,7 +241,7 @@ function splitPkgAtVersion(pkgAtVersion) {
 // not encoded in the filename. A single lookup either hits or misses --
 // no second attempt needed to tell "known bad" apart from "never checked".
 function attestationFilename(name, version) {
-  return `${name.replace('/', '-')}-${version}.attestation`;
+  return `${name.replace(/\//g, '-')}-${version}.attestation`;
 }
 
 // Given a real tarball's own filename (e.g. "core-3.0.1.tgz" for
@@ -198,6 +286,19 @@ class Attestations {
     this.sigstoreOptions = sharedConfig.sigstore ?? {};
     this.strictSsl =
       sharedConfig.strict_ssl !== undefined ? sharedConfig.strict_ssl : true;
+
+    // Only ever applied to a LOCAL publish's own .sigstore attachment (see
+    // _interceptPublish() below) -- never to a proxied, third-party
+    // package's upstream-fetched attestation (_resolveVerdict() never
+    // passes this to verifyBundle()/verifyAttestationsResponse(); see
+    // docs/configuration.md's "Verification" section for why that
+    // distinction matters). Absent/empty means no identity check at all --
+    // the same permissive-by-default posture block:/allow: already have --
+    // not a hard requirement, since this is new, opt-in hardening on top of
+    // existing behavior.
+    this.trustedPublishers = compileTrustedPublishers(
+      this.sigstoreOptions.trustedPublishers ?? [],
+    );
 
     // Default false: this plugin never talks to the real npm registry
     // unless explicitly opted into. When false, a proxied package with no
@@ -273,16 +374,21 @@ class Attestations {
   // blocked the same way -- "no proof" and "disproven" are treated
   // identically, both fail the requirement.
   //
-  // Never awaits a live network fetch here, only the fast tier (packument-
+  // Awaits the real resolution (_resolveVerdict(), which may include a
+  // bounded-timeout upstream fetch -- see UPSTREAM_FETCH_TIMEOUT_MS on
+  // _fetchFromUpstream() below) for any version the fast tier (packument-
   // embedded verdict, in-memory cache, or a single persisted-storage read)
-  // -- a version with no answer at any of those is failed closed
-  // immediately (consistent with "block: means require proof, no proof
-  // yet available also means no"), while the real check (which may include
-  // an upstream fetch, gated by fetchUpstream) runs in the background so a
-  // later read sees the actual verdict without this request ever blocking
-  // on it. This also means checking one version's status costs nothing
-  // extra for any of the package's *other* versions -- each is resolved
-  // independently, and all of them run concurrently, not one after another.
+  // doesn't already have an answer for. This used to fail closed
+  // immediately on a never-before-seen version and resolve it in the
+  // background instead -- deliberately changed: the very first read of any
+  // given version was *guaranteed* wrong (blocked, even for a package that
+  // would have verified cleanly) purely because nothing had checked it yet,
+  // which is a real, confusing false negative for whichever client happens
+  // to be first, not just a one-time cold-cache cost. Every gated version
+  // still resolves independently and concurrently (Promise.all below, same
+  // as before) -- checking one version's status still costs nothing extra
+  // for any of the package's *other* versions, only now the whole call
+  // waits for the slowest one to finish instead of returning early.
   async filter_metadata(packageInfo) {
     if (this.blockRules.length === 0) return packageInfo; // disabled
 
@@ -298,9 +404,16 @@ class Attestations {
     });
     if (gated.length === 0) return packageInfo;
 
-    const verdicts = await Promise.all(
+    const fastResults = await Promise.all(
       gated.map(ver =>
         this._resolveVerdictFast(packageInfo.name, ver, versions[ver]),
+      ),
+    );
+    const verdicts = await Promise.all(
+      gated.map((ver, i) =>
+        fastResults[i] !== undefined
+          ? fastResults[i]
+          : this._resolveVerdict(packageInfo.name, ver, versions[ver]),
       ),
     );
 
@@ -308,20 +421,7 @@ class Attestations {
     const replaceRequested = new Set();
 
     gated.forEach((ver, i) => {
-      const fast = verdicts[i];
-      if (fast === undefined) {
-        // Never resolved yet -- fail closed now, resolve for real in the
-        // background (may include an upstream fetch, if fetchUpstream
-        // allows it) so a subsequent read is fast and correct. Tracked in
-        // _pendingBackground so callers that need to know (tests, mainly --
-        // real request handling never waits on this) can deterministically
-        // await completion instead of guessing a timeout.
-        this._trackBackground(
-          `${packageInfo.name}@${ver}`,
-          this._resolveVerdict(packageInfo.name, ver, versions[ver]),
-        );
-      }
-      const result = fast ?? {verified: false, reason: 'not yet verified'};
+      const result = verdicts[i];
       if (result.verified) return;
 
       blocked.add(ver);
@@ -594,21 +694,60 @@ class Attestations {
     return new https.Agent({rejectUnauthorized: this.strictSsl});
   }
 
+  // Verdaccio's own config -- not a hardcoded assumption -- decides where a
+  // given package's content actually comes from: getMatchedPackagesSpec(name)
+  // (confirmed against @verdaccio/config's own source, the same method
+  // @verdaccio/local-storage-legacy's getPackageStorage() already uses for
+  // per-package storage routing) returns that package's own `proxy` list --
+  // the uplink name(s) its packages: pattern is configured to use -- and
+  // config.uplinks[name].url resolves each to an actual URL. A deployment
+  // proxying from somewhere other than the real npm registry (an internal
+  // mirror, Artifactory, an air-gapped replica) must have its attestations
+  // fetched from THAT source, not always the public internet regardless of
+  // what's actually configured -- querying the wrong registry could mean
+  // silently checking attestations for a different build of the package
+  // than the one this instance is actually serving, and unconditionally
+  // reaching out to the public npm registry defeats the entire point of an
+  // otherwise fully air-gapped uplink. Falls back to DEFAULT_UPSTREAM_REGISTRY
+  // only when a package genuinely has no proxy configured at all -- the
+  // same fallback Verdaccio's own DEFAULT_REGISTRY/DEFAULT_UPLINK constants
+  // already default to, not a value this plugin invents on its own.
+  _resolveUpstreamRegistryUrls(name) {
+    const config = this._getAuth()?.config;
+    const matched = config?.getMatchedPackagesSpec?.(name);
+    const proxyNames = matched?.proxy ? [].concat(matched.proxy) : [];
+    const urls = proxyNames
+      .map(uplinkName => config?.uplinks?.[uplinkName]?.url)
+      .filter(Boolean);
+    return urls.length > 0 ? urls : [DEFAULT_UPSTREAM_REGISTRY];
+  }
+
   async _fetchFromUpstream(name, version) {
-    try {
-      const res = await this._fetch(
-        `${REAL_NPM_REGISTRY}${ATTESTATIONS_PATH_PREFIX}${encodeURIComponent(name)}@${version}`,
-        {agent: this._requestAgent()},
-      );
-      if (!res.ok) return null;
-      return await res.json();
-    } catch (err) {
-      this.logger.warn(
-        {pkg: name, ver: version, err: err.message},
-        'verdaccio-attestations: failed to fetch attestation from upstream',
-      );
-      return null;
+    for (const registryUrl of this._resolveUpstreamRegistryUrls(name)) {
+      try {
+        const res = await this._fetch(
+          `${registryUrl.replace(/\/$/, '')}${ATTESTATIONS_PATH_PREFIX}${encodeURIComponent(name)}@${version}`,
+          {
+            agent: this._requestAgent(),
+            // filter_metadata() now awaits this call directly (see its own
+            // comment on why) rather than backgrounding it -- an unbounded
+            // fetch here would turn a slow/unresponsive upstream into a
+            // hung metadata read instead of the wrong-but-fast answer this
+            // used to give. A timeout (same treatment as any other fetch
+            // failure: logged, treated as "no attestation", never thrown
+            // past this method) bounds that without needing new config.
+            signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
+          },
+        );
+        if (res.ok) return await res.json();
+      } catch (err) {
+        this.logger.warn(
+          {pkg: name, ver: version, registryUrl, err: err.message},
+          'verdaccio-attestations: failed to fetch attestation from upstream',
+        );
+      }
     }
+    return null;
   }
 
   register_middlewares(app, auth, storage) {
@@ -766,6 +905,10 @@ class Attestations {
           {name: packageName, version, integrity},
           bundle,
           this.sigstoreOptions,
+          // Empty (the default, unconfigured) means no identity check --
+          // verifyBundle() treats a truthy-but-empty array as "matches
+          // nothing", so this must be null, not [], to mean "not enforced".
+          this.trustedPublishers.length > 0 ? this.trustedPublishers : null,
         )
       : {
           verified: false,
@@ -898,10 +1041,25 @@ class Attestations {
   // caching a verdict here would need the package's dist.integrity to
   // verify against, which a bare attestations request doesn't carry.
   async _handleGetAttestations(req, res) {
-    const parsed = splitPkgAtVersion(
-      decodeURIComponent(req.params.pkgAtVersion),
-    );
-    if (!parsed) return res.status(400).end();
+    // req.params.pkgAtVersion is already percent-decoded once by Express's
+    // own router (confirmed against the installed express/router package --
+    // layer.js's decode_param() runs decodeURIComponent on every captured
+    // param before it ever reaches a route handler). Decoding it again here
+    // would let a double-percent-encoded value (e.g.
+    // "%2540scope%252Fpkg%25401.0.0") smuggle a literal "/" or ".." past
+    // Express's own single decode pass, straight into name/version below.
+    // isSafePackageName()/isSafeVersion() are the real defense (they hold
+    // regardless of what a second decode could produce), but not decoding
+    // twice in the first place removes the easiest way to reach them with a
+    // surprising value.
+    const parsed = splitPkgAtVersion(req.params.pkgAtVersion);
+    if (
+      !parsed ||
+      !isSafePackageName(parsed.name) ||
+      !isSafeVersion(parsed.version)
+    ) {
+      return res.status(400).end();
+    }
     const {name, version} = parsed;
 
     const stored = await this._readStoredVerdict(name, version);

@@ -3,6 +3,7 @@
 const sigstore = require('sigstore');
 const npa = require('npm-package-arg');
 const ssri = require('ssri');
+const {minimatch} = require('minimatch');
 
 // The SLSA provenance predicate is the one that actually proves build/source
 // linkage (keyless, verified against Sigstore's own public trust root) --
@@ -19,6 +20,47 @@ const SLSA_PROVENANCE_PREDICATE_TYPES = new Set([
   'https://slsa.dev/provenance/v1',
 ]);
 
+// Not GitHub-specific -- deliberately mirrors this codebase's own
+// established convention (verdaccio-oidc-auth's entirely config-driven
+// verifier, this same plugin's block:/allow: minimatch rules): each entry
+// is a real minimatch pattern matched against the verified certificate's own
+// `identity.subjectAlternativeName` (a URI whose shape is entirely up to
+// whichever OIDC issuer minted it -- GitHub Actions' own is
+// "https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref>",
+// confirmed directly against a real captured bundle
+// (test/fixtures/actions-core-3.0.1-attestations.json), but GitLab CI,
+// CircleCI, or any other Sigstore-compatible issuer mints its own different
+// shape -- this plugin doesn't need to know any of them, only the operator
+// configuring `trustedPublishers` does), with an optional `issuer` field
+// (matched against `identity.extensions.issuer`, e.g.
+// "https://token.actions.githubusercontent.com") to also pin which OIDC
+// issuer must have minted it.
+function matchesTrustedPublisher(identity, trustedPublishers) {
+  if (!identity) return false;
+  return trustedPublishers.some(entry => {
+    if (entry.issuer && identity.extensions?.issuer !== entry.issuer) {
+      return false;
+    }
+    if (entry.subjectAlternativeName) {
+      const san = identity.subjectAlternativeName;
+      if (typeof san !== 'string') return false;
+      // dot: true -- minimatch's default *-exclusion for a path segment
+      // starting with "." (its own dotfile convention) would otherwise
+      // silently prevent every "**"/"*" pattern from ever matching a real
+      // GitHub Actions SAN at all: confirmed directly, GitHub's own SAN
+      // shape always routes through a literal "/.github/workflows/" segment
+      // (see the real captured example above), which minimatch treats like
+      // a hidden file unless told not to. Not GitHub-specific in effect --
+      // any other issuer's SAN with its own dot-segment would hit the same
+      // silent non-match without this.
+      if (!minimatch(san, entry.subjectAlternativeName, {dot: true})) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
 // Verifies a single raw Sigstore bundle (the exact shape a publish
 // attachment carries, and the shape of each entry in a GET
 // /-/npm/v1/attestations/... response's attestations[].bundle) against the
@@ -27,7 +69,21 @@ const SLSA_PROVENANCE_PREDICATE_TYPES = new Set([
 // whichever caller is checking it. predicateType is read from the parsed
 // statement itself, not a caller-supplied label, since the publish-time
 // attachment carries no such label at all.
-async function verifyBundle({name, version, integrity}, bundle, opts = {}) {
+//
+// trustedPublishers (an array of {issuer?, subjectAlternativeName?} entries
+// -- see matchesTrustedPublisher() above) is optional and, when given,
+// requires the signing certificate's own identity to match at least one
+// entry. See docs/configuration.md's "Verification" section for why this is
+// only meaningful for a locally-published package (the caller for a
+// proxied, third-party one must never pass this: there's no independent,
+// not-also-attacker-controlled source of truth for "the legitimate identity
+// for an arbitrary third-party package").
+async function verifyBundle(
+  {name, version, integrity},
+  bundle,
+  opts = {},
+  trustedPublishers = null,
+) {
   let purl;
   try {
     purl = npa.toPurl(npa(`${name}@${version}`));
@@ -82,12 +138,35 @@ async function verifyBundle({name, version, integrity}, bundle, opts = {}) {
     };
   }
 
+  // `opts` (from `sigstore:` config, default `{}`) confirms the signature is
+  // cryptographically genuine and Rekor-logged -- it does NOT, by default,
+  // check WHOSE identity signed it (certificateIdentityEmail/
+  // certificateIdentityURI/certificateIssuer/certificateOIDs, all unset).
+  // Deliberately not fixable for a proxied third-party package via `opts`
+  // itself: there's no independent (i.e. not also attacker-controlled once
+  // publish credentials are compromised) source of truth for "the
+  // legitimate repo for package X". trustedPublishers below is the
+  // *locally-published* case's answer instead -- a small, operator-curated
+  // list, checked against the verified certificate's own identity after the
+  // fact, not passed into sigstore.verify() itself (which only supports one
+  // static identity constraint, not "any of N").
+  let signer;
   try {
-    await sigstore.verify(bundle, opts);
+    signer = await sigstore.verify(bundle, opts);
   } catch (err) {
     return {
       verified: false,
       reason: `signature verification failed: ${err.message}`,
+    };
+  }
+
+  if (
+    trustedPublishers &&
+    !matchesTrustedPublisher(signer.identity, trustedPublishers)
+  ) {
+    return {
+      verified: false,
+      reason: `signed by an identity not in the trusted publisher list (${signer.identity?.subjectAlternativeName ?? 'no identity on this certificate'})`,
     };
   }
 
@@ -127,5 +206,6 @@ async function verifyAttestationsResponse(
 module.exports = {
   verifyBundle,
   verifyAttestationsResponse,
+  matchesTrustedPublisher,
   SLSA_PROVENANCE_PREDICATE_TYPES,
 };
