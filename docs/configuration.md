@@ -614,10 +614,18 @@ If the incoming body has no `_attachments` at all, or none of its keys end in
 non-publish requests to the same route, like `npm deprecate`/`npm star`, alone).
 Otherwise:
 
-1. The `.sigstore` attachment's base64 payload is parsed as a Sigstore bundle.
-   An unparseable attachment is dropped (logged as a `warn`) and the publish
-   proceeds with no attestation recorded, rather than failing the publish over a
-   malformed attachment.
+1. The `.sigstore` attachment's `data` is parsed directly as a JSON Sigstore
+   bundle -- unlike every other attachment (including the tarball itself), this
+   one is a **raw string, not base64**. Confirmed directly against real source,
+   not assumed: identical in npm CLI's own `libnpmpublish` (every version that
+   supports `--provenance` -- 9.9.4, 10.9.8, 11.18.0 all checked, zero
+   variation) and in Yarn's `@yarnpkg/plugin-npm` (v3.7.0, which explicitly
+   ports npm's own implementation) -- both embed `JSON.stringify(bundle)`
+   directly, since a JSON string is already safe to embed in a JSON body without
+   an extra encoding layer (unlike the tarball's raw binary, which genuinely
+   needs one). An unparseable attachment is dropped (logged as a `warn`) and the
+   publish proceeds with no attestation recorded, rather than failing the
+   publish over a malformed attachment.
 2. The bundle is verified via [`verifyBundle()`](#verification) against the
    published version's own `dist.integrity` -- a version with no
    `dist.integrity` present yet fails verification with an explicit reason

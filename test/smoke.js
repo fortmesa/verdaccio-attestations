@@ -406,7 +406,7 @@ async function main() {
         },
         _attachments: {
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
       };
@@ -437,7 +437,7 @@ async function main() {
         },
         _attachments: {
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
       };
@@ -466,7 +466,7 @@ async function main() {
         },
         _attachments: {
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
       };
@@ -1220,7 +1220,7 @@ async function main() {
         _attachments: {
           '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
       };
@@ -1265,6 +1265,61 @@ async function main() {
   );
 
   await check(
+    'a publish with a .sigstore attachment in its real (non-base64) format still verifies correctly',
+    async () => {
+      // Confirmed directly against real source, not assumed: unlike the
+      // tarball attachment (base64-encoded raw binary), the .sigstore
+      // attachment's `data` is the JSON.stringify()'d bundle as a RAW
+      // STRING -- no base64 layer at all, since a JSON string is already
+      // safe to embed directly in a JSON body. Identical in npm CLI's own
+      // libnpmpublish (every version that supports --provenance -- 9.9.4,
+      // 10.9.8, 11.18.0 all checked, zero variation) and in Yarn's
+      // @yarnpkg/plugin-npm (v3.7.0, which explicitly ports npm's own
+      // implementation). A prior version of this code unconditionally
+      // base64-decoded every attachment's `data`, which silently broke
+      // every real --provenance publish (decoding valid JSON text as
+      // base64 produces garbage bytes, logged as "unparseable .sigstore
+      // attachment") -- this is the regression test for that fix.
+      const plugin = makeAttestations({});
+      const storage = makeFakeStorage();
+      plugin._storage = wrapAsTopLevelStorage(storage);
+
+      const bundle = realProvenanceBundle();
+      const body = {
+        name: '@actions/core',
+        versions: {
+          '3.0.1': {version: '3.0.1', dist: {integrity: REAL_PKG.integrity}},
+        },
+        _attachments: {
+          '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
+          '@actions/core-3.0.1.sigstore': {
+            data: JSON.stringify(bundle), // raw string, matching real Yarn -- NOT base64
+          },
+        },
+      };
+
+      const res = makeFakeRes(201);
+      await plugin._interceptPublish(makeFakeReq(body), res, '@actions/core');
+
+      const attestations = body.versions['3.0.1'].dist.attestations;
+      assert.equal(
+        attestations.verified,
+        true,
+        'must correctly parse the raw (non-base64) attachment format real Yarn actually sends',
+      );
+      assert.equal(
+        attestations.predicateType,
+        'https://slsa.dev/provenance/v1',
+      );
+      assert.equal(
+        Object.keys(body._attachments).length,
+        1,
+        "Verdaccio's own hasDiffOneKey check must now pass",
+      );
+    },
+  );
+
+  await check(
     'a brand-new package (no record in storage yet) still gets its attestation stored -- deferred past the moment the package is actually created',
     async () => {
       const plugin = makeAttestations({});
@@ -1302,7 +1357,7 @@ async function main() {
         _attachments: {
           '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
       };
@@ -1339,7 +1394,7 @@ async function main() {
         _attachments: {
           '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
       };
@@ -1375,9 +1430,7 @@ async function main() {
         _attachments: {
           '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
           '@actions/core-3.0.1.sigstore': {
-            data: Buffer.from(JSON.stringify(tamperedBundle)).toString(
-              'base64',
-            ),
+            data: JSON.stringify(tamperedBundle), // raw string, matching real npm/Yarn -- NOT base64,
           },
         },
       };
@@ -1673,7 +1726,7 @@ async function main() {
           _attachments: {
             '@actions/core-3.0.1.tgz': {data: 'ZmFrZQ=='},
             '@actions/core-3.0.1.sigstore': {
-              data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+              data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
             },
           },
         });
@@ -2084,7 +2137,7 @@ async function main() {
       const body = {
         _attachments: {
           'core-3.0.1.tgz.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
         versions: {
@@ -2130,7 +2183,7 @@ async function main() {
       const body = {
         _attachments: {
           'core-3.0.1.tgz.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
         versions: {
@@ -2172,7 +2225,7 @@ async function main() {
       const body = {
         _attachments: {
           'core-3.0.1.tgz.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
         versions: {
@@ -2213,7 +2266,7 @@ async function main() {
       const body = {
         _attachments: {
           'core-3.0.1.tgz.sigstore': {
-            data: Buffer.from(JSON.stringify(bundle)).toString('base64'),
+            data: JSON.stringify(bundle), // raw string, matching real npm/Yarn -- NOT base64
           },
         },
         versions: {

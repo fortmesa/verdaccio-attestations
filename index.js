@@ -1135,11 +1135,22 @@ class Attestations {
 
     let bundle;
     try {
-      bundle = JSON.parse(
-        Buffer.from(body._attachments[sigstoreKey].data, 'base64').toString(
-          'utf8',
-        ),
-      );
+      // Unlike every other attachment (including the tarball itself, which
+      // is base64 -- raw binary genuinely needs that layer to embed safely
+      // in a JSON body), the .sigstore attachment's `data` is the
+      // JSON.stringify()'d bundle as a RAW STRING, with no base64 layer at
+      // all -- a JSON string is already safe to embed directly. Confirmed
+      // directly against real source, not assumed: identical in npm CLI's
+      // own libnpmpublish (every version that supports --provenance at
+      // all -- 9.9.4, 10.9.8, 11.18.0 all checked, zero variation; 6/7/8
+      // predate provenance support entirely, so there's no version that
+      // ever base64-encoded this) and in Yarn's @yarnpkg/plugin-npm
+      // (v3.7.0, which explicitly ports npm's own implementation). A prior
+      // version of this code unconditionally base64-decoded every
+      // attachment's `data`, which silently broke every real
+      // --provenance publish (decoding valid JSON text as base64 produces
+      // garbage bytes, logged as "unparseable .sigstore attachment").
+      bundle = JSON.parse(body._attachments[sigstoreKey].data);
     } catch (err) {
       this.logger.warn(
         {pkg: packageName, ver: version, err: err.message},
