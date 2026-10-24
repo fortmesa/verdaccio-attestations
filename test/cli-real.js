@@ -17,6 +17,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -113,7 +114,7 @@ async function registerUser(username) {
       headers: {'content-type': 'application/json'},
       body: JSON.stringify({
         name: username,
-        password: 'throwaway-pw',
+        password: crypto.randomBytes(16).toString('hex'),
         type: 'user',
         roles: [],
         date: new Date(0).toISOString(),
@@ -267,6 +268,32 @@ function makeYarnBerryClient() {
 // which is the part that actually varies per client (does dist.attestations
 // -- a field none of these clients know about -- break parsing on some
 // older major version?).
+// One request on a new connection (agent: false). The CLI checks run each
+// client with spawnSync, and only microtasks run between them, so a pooled
+// fetch() connection from before them can have been closed by Verdaccio
+// without this process noticing. fetch() then writes to the dead socket and
+// fails with "other side closed" before the request reaches Verdaccio.
+function registryRequest(method, url, {headers = {}, body} = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, {method, headers, agent: false}, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('error', reject);
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          text: async () => text,
+          json: async () => JSON.parse(text),
+        });
+      });
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 async function seedRealAttestedPackage() {
   const tarballBuf = fs.readFileSync(
     path.join(FIXTURES_DIR, 'actions-core-3.0.1.tgz'),
@@ -309,15 +336,15 @@ async function seedRealAttestedPackage() {
       },
       'actions-core-3.0.1.sigstore': {
         content_type: 'application/json',
-        data: Buffer.from(JSON.stringify(provenance.bundle)).toString('base64'),
+        data: JSON.stringify(provenance.bundle),
         length: 0,
       },
     },
   };
-  const res = await fetch(
+  const res = await registryRequest(
+    'PUT',
     `${REGISTRY_URL}/${encodeURIComponent('@actions/core')}`,
     {
-      method: 'PUT',
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
@@ -331,9 +358,11 @@ async function seedRealAttestedPackage() {
     );
 
   const packument = await (
-    await fetch(`${REGISTRY_URL}/${encodeURIComponent('@actions/core')}`, {
-      headers: {authorization: `Bearer ${token}`},
-    })
+    await registryRequest(
+      'GET',
+      `${REGISTRY_URL}/${encodeURIComponent('@actions/core')}`,
+      {headers: {authorization: `Bearer ${token}`}},
+    )
   ).json();
   const verified = packument.versions?.['3.0.1']?.dist?.attestations?.verified;
   if (verified !== true) {
@@ -379,10 +408,10 @@ async function seedUnattestedOldVersion() {
       },
     },
   };
-  const res = await fetch(
+  const res = await registryRequest(
+    'PUT',
     `${REGISTRY_URL}/${encodeURIComponent('@actions/core')}`,
     {
-      method: 'PUT',
       headers: {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
@@ -397,7 +426,7 @@ async function seedUnattestedOldVersion() {
 }
 
 // Real, end-to-end confirmation of the storage.localStorage fix: a verdict
-// resolved via filter_metadata()'s background fetchUpstream path (NOT a
+// resolved via filter_metadata()'s inline fetchUpstream path (NOT a
 // same-request local publish -- seedRealAttestedPackage() above never
 // exercises this, since it embeds dist.attestations.verified directly via
 // a raw PUT) must actually survive a real pod restart, not just an
@@ -415,6 +444,9 @@ async function runStoragePersistencePhase() {
   const storageDir = path.join(workdir, 'storage');
   const htpasswdFile = path.join(workdir, 'htpasswd');
   const configFile = path.join(workdir, 'config.yaml');
+  // The restarted process runs with fetchUpstream off, so the only way it
+  // can serve the version is from the verdict the first process stored.
+  const restartConfigFile = path.join(workdir, 'config.restart.yaml');
   const pluginsDir = path.join(workdir, 'plugins-node_modules');
 
   const scopeDir = path.join(pluginsDir, '@fortmesa');
@@ -425,7 +457,7 @@ async function runStoragePersistencePhase() {
     'dir',
   );
 
-  const config = `
+  const makeConfig = fetchUpstream => `
 storage: ${storageDir}
 plugins: ${pluginsDir}
 
@@ -450,7 +482,7 @@ packages:
 
 filters:
   '@fortmesa/verdaccio-attestations':
-    fetchUpstream: true
+    fetchUpstream: ${fetchUpstream}
     block:
       - '@actions/core':
           versions: '3.0.1'
@@ -467,17 +499,14 @@ log:
   fs.mkdirSync(path.dirname(htpasswdFile), {recursive: true});
   fs.writeFileSync(htpasswdFile, '');
   fs.mkdirSync(storageDir, {recursive: true});
-  fs.writeFileSync(configFile, config);
+  fs.writeFileSync(configFile, makeConfig(true));
+  fs.writeFileSync(restartConfigFile, makeConfig(false));
 
-  function startVerdaccioOnPort() {
+  function startVerdaccioOnPort(cfg) {
     const bin = path.join(PLUGIN_ROOT, 'node_modules', '.bin', 'verdaccio');
-    const proc = spawn(
-      bin,
-      ['--config', configFile, '--listen', String(port)],
-      {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+    const proc = spawn(bin, ['--config', cfg, '--listen', String(port)], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let output = '';
     proc.stdout.on('data', d => (output += d));
     proc.stderr.on('data', d => (output += d));
@@ -507,7 +536,7 @@ log:
         headers: {'content-type': 'application/json'},
         body: JSON.stringify({
           name: username,
-          password: 'throwaway-pw',
+          password: crypto.randomBytes(16).toString('hex'),
           type: 'user',
           roles: [],
           date: new Date(0).toISOString(),
@@ -556,31 +585,27 @@ log:
     });
   }
 
-  let proc = startVerdaccioOnPort();
+  let proc = startVerdaccioOnPort(configFile);
   try {
     await waitForUpOnPort();
     token = await registerUserOnPort('storage-persistence-tester');
 
+    // filter_metadata() fetches and verifies a never-seen version inline,
+    // so the very first install already succeeds.
     await check(
-      'storage.localStorage persistence: first install of a proxied, never-locally-published version fails closed (no verdict yet)',
+      'storage.localStorage persistence: first install of a proxied, never-locally-published version is verified inline and succeeds',
       () => {
         const install = installConsumer();
-        assert.notEqual(
+        assert.equal(
           install.status,
           0,
-          'must fail closed -- background resolution has not had a chance to run yet',
+          `install failed:\n${install.stdout}\n${install.stderr}`,
         );
       },
     );
 
-    // Give the background fetchUpstream + Sigstore verification (kicked off
-    // by the install attempt above's filter_metadata() call) time to
-    // actually complete -- a real network fetch plus real cryptographic
-    // verification, not instant.
-    await new Promise(r => setTimeout(r, 5000));
-
     await check(
-      'storage.localStorage persistence: same process, second install succeeds once background verification lands',
+      'storage.localStorage persistence: same process, a second install succeeds from the cached verdict',
       () => {
         const install = installConsumer();
         assert.equal(
@@ -602,15 +627,14 @@ log:
   // The actual point of this phase: a FRESH Verdaccio PROCESS, same storage
   // directory -- simulates a pod restart. Before the storage.localStorage
   // fix, the verdict computed above never actually reached disk (silently
-  // caught, logged, and lost), so this second process would repeat the
-  // exact same fail-closed-then-recover cycle from scratch. After the fix,
-  // the persisted verdict must be found on the very first request.
-  proc = startVerdaccioOnPort();
+  // caught, logged, and lost). With fetchUpstream off in this process, the
+  // install can only succeed if that stored verdict is found.
+  proc = startVerdaccioOnPort(restartConfigFile);
   try {
     await waitForUpOnPort();
 
     await check(
-      'storage.localStorage persistence: a genuinely NEW Verdaccio process (simulated pod restart) finds the persisted verdict immediately, no re-fetch needed',
+      'storage.localStorage persistence: a genuinely NEW Verdaccio process (simulated pod restart) with fetchUpstream off installs from the persisted verdict alone',
       () => {
         const install = installConsumer();
         assert.equal(
@@ -649,7 +673,6 @@ filters:
     block:
       - '@blocked/*'
       - '@actions/core':
-          versions: '1.0.0'
           strategy: replace
 
 middlewares:
@@ -868,10 +891,12 @@ log:
 
     // === every client: strategy: replace substitutes with the real
     // attested version's real content, not just remove ===
-    // (@actions/core@1.0.0 is real, unattested, and matches the
-    // versions: '1.0.0', strategy: replace rule above -- the packument
-    // keeps the "1.0.0" version key, but dist/tarball/integrity are copied
-    // wholesale from the substitute (3.0.1), so what a client actually
+    // (@actions/core@1.0.0 is real, unattested, and falls under the
+    // strategy: replace rule above. That rule covers every @actions/core
+    // version because a substitute must be one the same read gated and
+    // verified, so 3.0.1 has to be gated too. The packument keeps the
+    // "1.0.0" version key, but its record is copied from the substitute
+    // (3.0.1) minus signatures and attestations, so what a client actually
     // downloads and extracts is 3.0.1's real published tarball. Since both
     // are genuine npm-published packages, each tarball's OWN internal
     // package.json still says its own real version -- installing "1.0.0"

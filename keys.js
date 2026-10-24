@@ -63,6 +63,25 @@ function loadSigningKey(secretDir) {
     );
   }
 
+  // We sign with tls.key and publish tls.crt's public key, so a Secret whose
+  // two halves don't belong together would make every signature we produce
+  // fail EINTEGRITYSIGNATURE downstream. Sign and verify once to catch that
+  // at startup.
+  const probe = Buffer.from('verdaccio-attestations signing key check');
+  if (
+    !crypto.verify(
+      'sha256',
+      probe,
+      publicKey,
+      crypto.sign('sha256', probe, privateKey),
+    )
+  ) {
+    throw new Error(
+      `verdaccio-attestations: signing key at ${keyPath} does not match ` +
+        `the public key in ${certPath}`,
+    );
+  }
+
   const keyid = computeKeyId(publicKey);
   const expires = cert.validTo ? new Date(cert.validTo).toISOString() : null;
 
@@ -118,21 +137,9 @@ function normalizeUpstreamKeysResponse(body) {
     }));
 }
 
-// A keyid ("SHA256:<base64>") contains "/" and "+" whenever the underlying
-// base64 digest does -- both unsafe as a bare storage filename segment
-// (directory traversal risk for "/", and no benefit to preserving "+"/"="
-// verbatim either). This is a lookup-safe encoding only, never decoded back
-// -- the index file (see index.js's registry-keys storage) is what maps a
-// filename back to its real keyid.
-function keyStorageFilename(keyid) {
-  const safe = keyid.replace(/[^A-Za-z0-9]/g, '_');
-  return `key-${safe}.json`;
-}
-
 module.exports = {
   KEY_TYPE,
   computeKeyId,
   loadSigningKeys,
   normalizeUpstreamKeysResponse,
-  keyStorageFilename,
 };

@@ -26,41 +26,50 @@ any publish whose `_attachments` has more than one key, which is exactly what a
 real `npm publish --provenance` sends (the tarball plus a `.sigstore` bundle).
 The bundle is cryptographically verified (via the real
 [`sigstore`](https://www.npmjs.com/package/sigstore) package, not an
-existence-only check), stored, and the `.sigstore` attachment is stripped so the
-publish itself always succeeds -- a failed verification is recorded, not
-rejected, so a compromised or malformed attestation never blocks a legitimate
-publish outright.
+existence-only check) against the uploaded tarball's own bytes, stored, and the
+`.sigstore` attachment is stripped so the publish itself always succeeds -- a
+failed verification is recorded, not rejected, so a compromised or malformed
+attestation never blocks a legitimate publish outright. This happens only for a
+publish Verdaccio would accept from that user, and any `dist.attestations` or
+`dist.signatures` a client sends is discarded: only the registry writes them.
 
 **On read**, serves a package's attestation via the real npm endpoint
 (`GET /-/npm/v1/attestations/<name>@<version>`) -- preferring whatever's already
 stored (from a local publish, or a verdict already computed for a proxied
-package), and optionally relaying/caching from `registry.npmjs.org` for packages
-this registry doesn't have local provenance for (see `fetchUpstream` below).
+package), and optionally relaying from the package's own uplink for a proxied
+package this registry doesn't have local provenance for (see `fetchUpstream`
+below). The route applies Verdaccio's own access rules for the package.
 
 **Optionally, as an enforcement filter**: a `block`/`allow` list (same
 minimatch + semver-range rule shape as `verdaccio-security-filter`) requires a
 verified attestation for matching versions before they show up in package
 metadata at all -- a version with no attestation, or one that fails
 verification, is blocked identically ("no proof" and "disproven" are treated the
-same way). Checking one version never blocks on network I/O for another: a fast,
-zero-network tier (already-stored verdict, or an in-memory/persisted cache hit)
-is all `filter_metadata()` ever awaits inline; anything not yet known is failed
-closed immediately and resolved for real in the background, so one slow
-verification never delays every other version's read.
+same way). Each gated version is first looked up in a fast, zero-network tier
+(an in-memory cache hit, or one persisted-storage read); one with no answer
+there is resolved for real (upstream fetch when `fetchUpstream` allows it, then
+`sigstore.verify()`), awaited inline with a 5-second bound on the fetch. Every
+version resolves concurrently, so one slow verification never delays another
+version's. An answer that isn't a verdict (no integrity, a lookup that failed)
+is never cached, and an internal error removes every gated version rather than
+serving them.
 
 See [`docs/configuration.md`](docs/configuration.md) for the full reference:
 `block`/`allow` matching and `strategy: replace`, the `fetchUpstream` flag
 (including its per-request override via `verdaccio-offline-enforcer`'s
 online/offline identity policy) and why it defaults to `false`, the
-single-object verdict storage design (and why), the fast-tier/background-
-verification architecture, proxy support, and the publish/delete-time
-interception mechanics.
+single-object verdict storage design (and why), the fast-tier verification
+architecture, proxy support, and the publish/delete-time interception mechanics.
 
 ## Installation
 
 ```bash
 npm install @fortmesa/verdaccio-attestations
 ```
+
+Needs Node.js 22.12 or later. `sigstore` and `https-proxy-agent` ship only as ES
+modules, and 22.12 is the first 22.x release whose `require()` loads one without
+a flag.
 
 Verdaccio resolves a plugin by package name against whatever `plugins:` path
 you've configured -- see Verdaccio's own docs on
@@ -97,12 +106,12 @@ yarn test
 Runs a single hand-rolled `node:assert`-based smoke test file (no test
 framework/build step) covering `verify.js`'s cryptographic verification (against
 a real, captured `@actions/core@3.0.1` attestation fixture), `block`/`allow`
-matching and substitution, the fast-tier/background verification split,
-`fetchUpstream` gating (including its per-request `verdaccio-offline-enforcer`
-override), proxy agent selection, publish/delete interception, the attestations
-GET route, and several true end-to-end checks against a real Express app and
-real HTTP requests. `yarn test:cli` drives real npm (8-11) and yarn (classic +
-berry) binaries against a real running Verdaccio process, including a genuine
+matching and substitution, fast-tier and real verification, `fetchUpstream`
+gating (including its per-request `verdaccio-offline-enforcer` override), proxy
+agent selection, publish/delete interception, the attestations GET route, and
+several true end-to-end checks against a real Express app and real HTTP
+requests. `yarn test:cli` drives real npm (8-11) and yarn (classic + berry)
+binaries against a real running Verdaccio process, including a genuine
 process-restart check that a verdict persisted via `storage.localStorage`
 survives it.
 
@@ -113,12 +122,14 @@ trust root. `minimatch` -- `block`/`allow` pattern matching, the same convention
 Verdaccio's own `packages:` config and `@verdaccio/utils` use. `semver` --
 version-range scoping for `block`/`allow` rules and sorting replacement
 candidates. `npm-package-arg` -- builds the purl an attestation subject is
-checked against. `ssri` -- parses `dist.integrity` into the digest an
-attestation subject is checked against. `node-fetch` -- upstream requests when
-`fetchUpstream` is enabled. `https-proxy-agent` -- proxy support for those
-requests. `body-parser` -- parses the publish request body ahead of Verdaccio's
-own parsing, to intercept a `.sigstore` attachment before Verdaccio's
-`hasDiffOneKey()` check ever sees it.
+checked against. `https-proxy-agent` -- proxy support for upstream requests.
+`body-parser` -- parses the publish request body when Verdaccio hasn't already,
+to intercept a `.sigstore` attachment before Verdaccio's `hasDiffOneKey()` check
+ever sees it. Kept on the same 1.x range Verdaccio's own `express` 4 declares,
+so one copy is installed.
+
+Upstream requests and the `dist.integrity` checks use Node's own `http`, `https`
+and `crypto` modules.
 
 ## License
 

@@ -116,10 +116,15 @@ verified version (falling back to the nearest newer one, then to a hard removal
 if neither exists) instead of removing the blocked version outright -- the same
 substitute algorithm and rationale as `verdaccio-security-filter`'s own
 `strategy: replace`. Multiple matching `block` rules only produce `replace` if
-_every_ one of them says `replace`; otherwise the safer `remove` wins. The
-packument keeps the blocked version's key and `version` field, but its `dist` is
-copied wholesale from the substitute, so what actually gets installed for that
-version number is the substitute's real, already-attested content.
+_every_ one of them says `replace`; otherwise the safer `remove` wins. A
+substitute must be a version this same read gated and verified, so a version no
+rule covers, which nothing checked, is never used, and a version whose key isn't
+valid semver is neither used nor given a substitute. The blocked version's entry
+becomes a copy of the substitute's whole version record with `version`
+rewritten, minus `dist.signatures` and `dist.attestations`: both name the
+substitute's own version, so under the blocked version's number they would fail
+`npm audit signatures` and the attestation subject check. What actually gets
+installed for that version number is the substitute's attested tarball.
 
 After blocking, any `dist-tags` entry (e.g. `latest`) pointing at a version
 actually removed is redirected to the newest remaining version (preferring a
@@ -157,12 +162,22 @@ package (as opposed to a package published locally to this registry, where the
 operator's own OIDC config already independently establishes who's trusted to
 publish what).
 
-The two "not yet known" outcomes -- missing `dist.integrity` to verify against,
-and `fetchUpstream` being disabled or effectively disabled for this request --
-are deliberately **not** persisted to storage or cached past the single request
-that produced them: turning `fetchUpstream` on later, or a subsequent read that
-does have `dist.integrity`, gets a real re-attempt rather than a permanently
-calcified bad verdict from before the missing piece was available.
+Three outcomes are not verdicts, so none is cached or persisted: a missing
+`dist.integrity` to verify against; `fetchUpstream` disabled or effectively
+disabled for this request (an offline-restricted or anonymous caller, see
+below); and a lookup or signature check that couldn't finish (a timeout, a 5xx
+or network error from the uplink, or `sigstore.verify()` failing to refresh its
+TUF trust root). Each is answered as unverified for that read only, so turning
+`fetchUpstream` on, a read that has `dist.integrity`, or an online caller gets a
+real attempt. After a failed lookup or check, the version isn't tried again for
+60 seconds (`UPSTREAM_RETRY_BACKOFF_MS` in `index.js`), so an outage doesn't add
+a 5-second wait to every read. An uplink answering 404 ("no attestation
+upstream") is a verdict, and is cached in memory.
+
+A package whose `packages:` entry has no `proxy` is never looked up upstream:
+Verdaccio contacts no uplink for it, and sending a private package's name to the
+public registry would leak it. Only a version string that's valid semver is
+looked up, URL-encoded.
 
 ### Per-request override: `verdaccio-offline-enforcer` identities never trigger a live fetch
 
@@ -216,32 +231,45 @@ another version -- `filter_metadata()` resolves every gated version concurrently
 (`Promise.all`), so version `A` never delays version `B`. Two tiers, evaluated
 per version:
 
-1. **Fast (no network)** -- the packument's own `dist.attestations.verified`
-   (already embedded, e.g. from a local publish this same process handled), an
-   in-memory cache hit from a verdict this process already resolved, or (on a
-   cache miss) exactly one persisted-storage read of the object described in
+1. **Fast (no network)** -- an in-memory cache hit from a verdict this process
+   already resolved, or (on a cache miss) exactly one persisted-storage read of
+   the object described in
    [Storage design](#storage-design-one-object-per-packageversion) below --
-   cheap enough to pay on every metadata read.
+   cheap enough to pay on every metadata read. Either counts only if it was
+   computed for the version's current `dist.integrity`. The packument's own
+   `dist.attestations.verified` is never read as a verdict: whoever publishes a
+   version writes its metadata, so a publisher could set it to `true` on a
+   version with no provenance at all.
 2. **Real** -- for any version the fast tier has no answer for: the upstream
    fetch `fetchUpstream` gates (bounded by a 5-second timeout --
    `UPSTREAM_FETCH_TIMEOUT_MS` in `index.js` -- so a slow/unresponsive upstream
    can't turn a metadata read into a hang instead of a bounded wait), plus
-   actual `sigstore.verify()` cryptographic work. `filter_metadata()` awaits
-   this directly rather than returning a fail-closed answer immediately and
-   resolving it in the background: a never-before-seen version's _first_ read
-   used to be guaranteed wrong (blocked, even for a package that would have
-   verified cleanly) purely because nothing had checked it yet -- a real,
-   confusing false negative for whichever client happened to be first, not just
-   a one-time cold-cache cost.
+   actual `sigstore.verify()` cryptographic work, which makes network calls of
+   its own (a TUF trust-root refresh, with its own 5-second timeout and two
+   retries) that this timeout doesn't cover. `filter_metadata()` awaits this
+   directly rather than returning a fail-closed answer immediately and resolving
+   it in the background: a never-before-seen version's _first_ read used to be
+   guaranteed wrong (blocked, even for a package that would have verified
+   cleanly) purely because nothing had checked it yet -- a real, confusing false
+   negative for whichever client happened to be first, not just a one-time
+   cold-cache cost.
 
-Once resolved (either tier), the verdict is cached in-memory and persisted, so a
-second read of the same version never repeats the real resolution.
+Once resolved, a verdict is cached in memory and, when there's a bundle to keep,
+persisted, so a second read of the same version never repeats the real
+resolution. What isn't a verdict is never cached (see
+[fetchUpstream and live upstream calls](#fetchupstream-and-live-upstream-calls)
+above).
 
-The plugin exposes `whenAllBackgroundWorkSettles()` for the _other_ background
-work it still does -- `_interceptPublish()`'s deferred storage write after a
-local publish (see [Publish-time interception](#publish-time-interception)
-below) -- letting a test deterministically await it instead of guessing a
-timeout. Real request handling never calls it.
+If anything inside `filter_metadata()` throws, every version a `block` rule
+covers is removed from that response. Verdaccio's own filter runner catches a
+filter's error and serves the packument it passed in, unfiltered, so letting the
+error escape would serve every gated version.
+
+The plugin exposes `whenAllBackgroundWorkSettles()` for the background work it
+does -- `_interceptPublish()`'s deferred storage write after a local publish
+(see [Publish-time interception](#publish-time-interception) below) and the
+registry key refresh -- letting a test deterministically await it instead of
+guessing a timeout. Real request handling never calls it.
 
 ## Verification
 
@@ -250,7 +278,8 @@ to belong to, and never throws -- always returns `{verified, reason}` (or
 `{verified: true, predicateType}`), so one malformed/invalid bundle can't take
 down whichever caller is checking it:
 
-1. The bundle's DSSE envelope payload is parsed as an in-toto statement.
+1. The bundle's DSSE envelope payload is parsed as an in-toto statement, which
+   must be a JSON object.
 2. `statement.predicateType` must be a SLSA provenance predicate
    (`https://slsa.dev/provenance/v0.2` or `.../v1`). npm's own keyed "publish
    attestation" (`https://github.com/npm/attestation/.../publish/v0.1`) is
@@ -260,13 +289,19 @@ down whichever caller is checking it:
    "attested" means for this plugin's purposes.
 3. `statement.subject[0].name` must match the package's own purl
    (`pkg:npm/<name>@<version>`, built via `npm-package-arg`).
-4. `statement.subject[0].digest.sha512` must match the package's
-   `dist.integrity`, parsed to a hex digest via `ssri`.
+4. `dist.integrity` must be exactly one `sha512-<base64>` entry, which is what
+   npm writes, and `statement.subject[0].digest.sha512` must match it. An SRI
+   string can list several hashes, and a client accepts a tarball that matches
+   any of them, so a second sha512 entry would let one tarball be attested and
+   another installed. Any other integrity string fails verification.
 5. Only after all of the above pass does it call the real
    `sigstore.verify(bundle, opts)` -- actual cryptographic verification against
    Sigstore's public trust root, not an existence-only check. `opts` is whatever
    `sigstore:` is configured to in `filters:` (see [Full config](#full-config)
-   above), passed straight through.
+   above), passed straight through. A `VerificationError`, `PolicyError` or
+   `ValidationError` from it is the verdict. Any other error (a `TUFError` when
+   the trust root can't be refreshed, an `InternalError`) means the check didn't
+   finish, so the result is marked transient and never recorded as a verdict.
 
 **Signer identity: checkable for a locally-published package, not for a proxied
 one.** `sigstore.verify()` alone only confirms the bundle is a cryptographically
@@ -326,7 +361,9 @@ attestation _first_ and the SLSA provenance one _second_).
 `verifyAttestationsResponse()` tries each in order until one verifies, and
 returns the bundle that actually produced the verdict alongside it -- a caller
 that needs to persist "the bundle this verdict is about" cannot assume
-`attestations[0]` is it.
+`attestations[0]` is it. A response whose `attestations` isn't an array, or an
+entry without a bundle object, fails verification instead of throwing; when no
+entry verifies and any failed transiently, the whole result is transient.
 
 ## Registry signatures
 
@@ -365,14 +402,14 @@ the one package.
 
 ### `GET /-/npm/v1/keys`
 
-Registered unconditionally (same as the attestations route), serving the union
-of:
+Registered unconditionally (same as the attestations route), serving, in this
+order:
 
-1. Every upstream registry signing key this deployment has relayed (see
-   [Upstream key relay](#upstream-key-relay) below).
-2. This deployment's own configured `sigstore.signingKeys` (see
+1. This deployment's own configured `sigstore.signingKeys` (see
    [Registry-signing a local publish](#registry-signing-a-local-publish) below),
    if any.
+2. Every upstream registry signing key this deployment has relayed (see
+   [Upstream key relay](#upstream-key-relay) below).
 
 ### Upstream key relay
 
@@ -397,28 +434,19 @@ directly unless explicitly opted into") covers -- it only ever fetches
 `/-/npm/v1/keys` itself, nothing else, from uplinks this deployment is already
 configured to proxy from for ordinary installs.
 
-A key already known with identical contents is neither re-persisted nor
-re-counted as a change -- upstream signing keys rotate on the order of months to
-years, so in the ordinary case a refresh cycle past the first is a no-op. A
-fetch failure for one uplink never prevents another uplink's keys from being
+A fetch failure for one uplink never prevents another uplink's keys from being
 relayed.
 
-**Storage**: `storage.localStorage` has no listing/enumeration capability at all
-(see
-[Why `storage.localStorage`, not `storage` directly](#why-storagelocalstorage-not-storage-directly)
-above), so there's no way to ask "what upstream keys have I already stored"
-other than tracking that list explicitly -- one small index object
-(`{keyids: [...]}`) alongside one object per relayed key, named by a sanitized
-encoding of its own `keyid`. Both live under a dedicated, reserved storage
-namespace (`.verdaccio-attestations-registry-keys`) rather than a real package
-name -- deliberately an invalid, unpublishable npm package name (npm itself
-rejects a name starting with `.`), so no publish, by anyone with publish rights,
-could ever collide with or overwrite this plugin's own key storage.
+A client looks a signature's key up by `keyid` alone and takes the first match,
+so two rules keep one source from answering for another. A `keyid` matching one
+of this registry's own `signingKeys` is never taken from an uplink. A `keyid`
+already relayed from one uplink is refused from any other, and a different key
+under the same `keyid` logs a warning; the first uplink keeps it until restart.
 
-**Warm start**: on `register_middlewares()`, the in-memory cache is populated
-from whatever's already persisted before the first live refresh cycle even runs,
-so `GET /-/npm/v1/keys` has real answers immediately after a pod restart rather
-than an empty list until the first fetch completes.
+Relayed keys live in memory only. After a restart, the refresh that runs at
+startup fills them in again; until it succeeds (say, while npmjs.org is
+unreachable), only this registry's own keys are served, and
+`npm audit signatures` reports `EMISSINGSIGNATUREKEY` for proxied packages.
 
 ### Registry-signing a local publish
 
@@ -446,7 +474,10 @@ plugin -- the certificate's subject, validity window (beyond a real `expires`),
 and issuer are never checked against anything; the certificate here exists only
 to carry the public key and a validity end date (surfaced as `expires` in the
 served `publicKeyEntry`), not to establish any identity the way a
-Sigstore/Fulcio certificate does.
+Sigstore/Fulcio certificate does. At startup the plugin signs and verifies a
+test message with each pair, and refuses to start if `tls.key` doesn't match the
+public key in `tls.crt`: every signature it produced would otherwise fail
+`EINTEGRITYSIGNATURE` downstream.
 
 **When signing actually happens**: only during
 [publish-time interception](#publish-time-interception), and only when **both**
@@ -488,10 +519,29 @@ included) typically bill per object with a real minimum regardless of content
 size, so a second, often-tiny file per version would be a genuine cost at this
 data's scale. Named `<name-with-/-replaced-by-->-<version>.attestation`,
 alongside the tarball in the same per-package storage location, holding
-`{verified, bundle, reason}` (`reason` present only when `verified: false`) --
-the verdict is a field in the object's own contents, not encoded in its
-filename, so a lookup is a single hit-or-miss, never two attempts to tell "known
-bad" apart from "never checked".
+`{verified, integrity, bundle, reason}` (`reason` present only when
+`verified: false`) -- the verdict is a field in the object's own contents, not
+encoded in its filename, so a lookup is a single hit-or-miss, never two attempts
+to tell "known bad" apart from "never checked".
+
+`integrity` is the `dist.integrity` the verdict was computed for, and the object
+counts only while it matches the version's current `dist.integrity`. Objects
+written by 1.1.x and earlier carry no `integrity`, so they are ignored and the
+version is resolved again: a proxied one through `fetchUpstream`, while a local
+one stays unverified until it's republished with provenance.
+
+A local publish whose `sigstore.verify()` couldn't finish (see
+[Verification](#verification)) still stores its bundle, as
+`{verified: false, transient: true, identityChecked, integrity, bundle, reason}`.
+Such an object is not a verdict: the next read verifies the stored bundle again
+(no uplink involved), applying `trustedPublishers` if `identityChecked` says the
+publish did, and caches that outcome in memory.
+
+These objects are the registry's own. A client's
+`PUT /:package/-/<name>.attestation/...`, a publish body with an `.attestation`
+attachment, and a `DELETE` of an `.attestation` file all get a 403, since
+Verdaccio would otherwise store or remove whatever a publisher sends under that
+name.
 
 ### Why `storage.localStorage`, not `storage` directly
 
@@ -517,9 +567,9 @@ via the same generic interface every Verdaccio storage backend implements --
 deliberately not S3-specific object metadata or tags, so behavior is identical
 regardless of which backend a deployment is configured with.
 `storage.localStorage` has existed under that exact name since Verdaccio 2.3.0
-(2017), unchanged through the 3.0 TypeScript rewrite and the 5→6 major version
-jump -- stable in practice, though it is an internal implementation detail
-Verdaccio's plugin API does not formally document or guarantee.
+(2017), unchanged through the 3.0 TypeScript rewrite and the 5-to-6 major
+version jump -- stable in practice, though it is an internal implementation
+detail Verdaccio's plugin API does not formally document or guarantee.
 
 ### In-memory-only fallback
 
@@ -577,8 +627,8 @@ Verdaccio's own behavior, it does not improve on it.
 verdict persisted before a restart is found on the very _first_ metadata read
 afterward, at the fast tier described above -- a fresh process's empty in-memory
 cache is irrelevant, since the persisted object is checked before ever falling
-back to the (background-only) real resolution. No re-fetch, no re-verification.
-Without `storage.localStorage` reachable, see
+back to the real resolution. No re-fetch, no re-verification. Without
+`storage.localStorage` reachable, see
 [In-memory-only fallback](#in-memory-only-fallback) above instead -- this
 guarantee does not hold.
 
@@ -592,15 +642,34 @@ setting, read from the same `auth` object every plugin's
 `register_middlewares()` receives. This means a firewalled/corporate deployment
 that already routes outbound npm traffic through a specific proxy gets the same
 behavior here as it does for Verdaccio's own uplinks, with no separate proxy
-config for this plugin.
+config for this plugin. An `http://` uplink gets a plain `http.Agent`, without
+the proxy.
+
+This covers the plugin's own requests (attestation lookups and the key relay),
+not `sigstore.verify()`'s. Each verification refreshes Sigstore's TUF trust root
+from `tuf-repo-cdn.sigstore.dev` through Node's built-in `fetch`, which ignores
+`https_proxy`. A deployment whose only way out is that proxy needs one of:
+direct egress to that host; Node started with `--use-env-proxy` (24.5 and later,
+which 22.12 doesn't have) and `HTTPS_PROXY` set; or the
+`tufMirrorURL`/`tufCachePath`/`tufForceCache` options under `sigstore:`, which
+go straight to `sigstore.verify()`. Without one of those, every verification
+fails transiently: nothing is recorded as a verdict, and gated versions stay
+blocked.
 
 ## Publish-time interception
 
 A `PUT` to the publish route is intercepted by a middleware that runs **before
 Verdaccio's own router** even mounts (so `req.params.package` does not exist yet
--- the package name is parsed directly from `req.path` instead), and before
-Verdaccio's own body-parser installs, so this plugin parses the request body
-itself.
+-- the package name is parsed directly from `req.path` instead, in both the
+encoded `/@scope%2Fpkg` and the unencoded `/@scope/pkg` form). When Verdaccio
+hasn't already parsed the body, this plugin parses it with its own
+`body-parser`: `application/json` only, up to `max_body_size` (413 past it),
+with malformed JSON answered 400.
+
+Verdaccio checks publish permission only in its own router, after every plugin
+middleware has run. So this plugin asks it first (`auth.allow_publish`), and
+does nothing for a request Verdaccio would refuse: no verification, no cached
+verdict, no network call. The request passes through for Verdaccio to reject.
 
 **Why this has to happen before Verdaccio's own handling**: Verdaccio's core
 publish handler's `hasDiffOneKey()` check hard-rejects any publish whose
@@ -609,10 +678,12 @@ publish handler's `hasDiffOneKey()` check hard-rejects any publish whose
 Without this interception, provenance-enabled publishes to a registry running
 this plugin would fail outright today.
 
-If the incoming body has no `_attachments` at all, or none of its keys end in
-`.sigstore`, the request passes through untouched (this also naturally leaves
-non-publish requests to the same route, like `npm deprecate`/`npm star`, alone).
-Otherwise:
+If the incoming body has no `_attachments` and `versions` objects, the request
+passes through untouched (this also naturally leaves non-publish requests to the
+same route, like `npm deprecate`/`npm star`, alone). For a real publish,
+`dist.attestations` and `dist.signatures` are first removed from every version
+in the body, since only this plugin writes them. If no attachment key ends in
+`.sigstore`, that's all. Otherwise:
 
 1. The `.sigstore` attachment's `data` is parsed directly as a JSON Sigstore
    bundle -- unlike every other attachment (including the tarball itself), this
@@ -626,15 +697,20 @@ Otherwise:
    needs one). An unparseable attachment is dropped (logged as a `warn`) and the
    publish proceeds with no attestation recorded, rather than failing the
    publish over a malformed attachment.
-2. The bundle is verified via [`verifyBundle()`](#verification) against the
-   published version's own `dist.integrity` -- a version with no
-   `dist.integrity` present yet fails verification with an explicit reason
+2. The uploaded tarball attachment is decoded and checked against the published
+   version's `dist.integrity`, which must be a single sha512 entry (see
+   [Verification](#verification)). The client writes that field, and Verdaccio
+   checks only the sha1 `shasum`, and only when one is sent; a mismatch fails
+   verification (and so nothing is signed). Then the bundle is verified via
+   [`verifyBundle()`](#verification) against `dist.integrity` -- a version with
+   no `dist.integrity` present yet fails verification with an explicit reason
    rather than skipping the check.
-3. The bundle and verdict are persisted via the same
+3. Once Verdaccio has accepted the publish (its response finishes with a status
+   below 300), the bundle and verdict are persisted via the same
    [single-object storage](#storage-design-one-object-per-packageversion)
-   proxied packages use, and the in-memory verdict cache is populated
-   immediately -- a locally-published package's own next metadata read never
-   needs to touch storage at all.
+   proxied packages use, and the in-memory verdict cache is populated, so a
+   locally-published package's own next metadata read never needs to touch
+   storage at all. A publish Verdaccio rejects leaves neither behind.
 4. `dist.attestations = {url, verified, reason, predicateType}` is injected
    directly into the request body's version metadata, and the `.sigstore` key is
    deleted from `_attachments` -- down to exactly one attachment, so Verdaccio's
@@ -663,6 +739,11 @@ a proxied package).
 since a scoped package's own leading `@` is never the last one) after
 URL-decoding.
 
+The route runs the same access check Verdaccio's own `GET /:package` does
+(`auth.allow_access`) and answers a denial with its status, so a package
+restricted to some users doesn't have its versions, tarball digests and build
+identities readable by everyone through this route.
+
 Prefers whatever's already stored -- in the ordinary case, `filter_metadata()`
 already ran on the packument fetch that surfaced this URL to the client in the
 first place, so this is usually a hit. On a genuine miss, this relays the raw
@@ -688,7 +769,8 @@ Deferred to the response's own `finish` event and gated on a non-3xx status,
 same as publish-time storage (see
 [Publish-time interception](#publish-time-interception) above) -- a rejected
 delete (e.g. permission denied) never triggers cleanup for a tarball that's
-still actually there. See
+still actually there. A successful one also drops the version's in-memory
+verdict. A `DELETE` naming an `.attestation` file itself gets a 403. See
 [Verdict lifecycle matches its tarball's](#verdict-lifecycle-matches-its-tarballs-deliberately-never-more)
 above for which deletion paths this plugin does and does not follow.
 
@@ -713,17 +795,18 @@ is plumbing around it. `minimatch` -- `block`/`allow` pattern matching, the same
 convention Verdaccio core and `verdaccio-security-filter` both use. `semver` --
 version-range scoping for `block`/`allow` rules, and sorting substitution
 candidates for `strategy: replace`. `npm-package-arg` -- builds the purl an
-attestation subject's name is checked against. `ssri` -- parses `dist.integrity`
-into the hex digest an attestation subject's digest is checked against.
-`node-fetch` -- upstream requests: attestation fetches only ever made when
-`fetchUpstream: true`, plus the
-[upstream registry key relay](#upstream-key-relay)'s own `GET /-/npm/v1/keys`
-requests, which are unconditional (see that section for why).
-`https-proxy-agent` -- proxy support for those requests (see
+attestation subject's name is checked against. Node's own `node:http` and
+`node:https` make the upstream requests: attestation fetches, only ever made
+when `fetchUpstream: true`, and the
+[upstream registry key relay](#upstream-key-relay)'s `GET /-/npm/v1/keys`
+requests, which are unconditional (see that section for why). Each request uses
+the agent described under [Proxy support](#proxy-support) and follows up to 20
+redirects. `https-proxy-agent` -- proxy support for those requests (see
 [Proxy support](#proxy-support) above), unused without `auth.config.https_proxy`
-configured. `body-parser` -- parses the publish request body ahead of
-Verdaccio's own parsing, to intercept a `.sigstore` attachment before
-Verdaccio's `hasDiffOneKey()` check ever runs. Node's built-in
+configured. `body-parser` -- parses the publish request body when Verdaccio
+hasn't already, to intercept a `.sigstore` attachment before Verdaccio's
+`hasDiffOneKey()` check ever runs. It stays on 1.x, the major Verdaccio's own
+`express` 4 uses, with the same range, so one copy is installed. Node's built-in
 `node:async_hooks` (`AsyncLocalStorage`) -- carries the current request's
 offline-restriction decision from `register_middlewares()` (real `req` access)
 down into `filter_metadata()` and the attestations route handler (neither has

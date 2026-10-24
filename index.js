@@ -1,7 +1,9 @@
 'use strict';
 
-// Pinned to 1.x deliberately -- DO NOT bump to 2.x. Verdaccio's own core
-// publish handler still bundles body-parser@1.20.5 internally, and 1.x/2.x
+// Pinned to 1.x deliberately -- DO NOT bump to 2.x. Verdaccio parses
+// request bodies with express.json() from express 4 (4.22.3 in Verdaccio
+// 6.10.7), which declares body-parser ~1.20.5, and package.json declares
+// that same range so only one copy is ever installed. 1.x/2.x also
 // don't safely chain: 1.x's read() flags an already-consumed request via an
 // explicit req._body flag set synchronously; 2.x instead checks
 // onFinished.isFinished(req), an async/event-based signal that can still
@@ -15,16 +17,18 @@
 const bodyParser = require('body-parser');
 const semver = require('semver');
 const {minimatch} = require('minimatch');
-const nodeFetch = require('node-fetch');
+const crypto = require('node:crypto');
+const http = require('node:http');
 const https = require('node:https');
+const {text: readStreamText} = require('node:stream/consumers');
 const {AsyncLocalStorage} = require('node:async_hooks');
 const {HttpsProxyAgent} = require('https-proxy-agent');
-const {verifyBundle, verifyAttestationsResponse} = require('./verify');
 const {
-  loadSigningKeys,
-  normalizeUpstreamKeysResponse,
-  keyStorageFilename,
-} = require('./keys');
+  verifyBundle,
+  verifyAttestationsResponse,
+  sha512Digest,
+} = require('./verify');
+const {loadSigningKeys, normalizeUpstreamKeysResponse} = require('./keys');
 
 // Must match this package's name -- Verdaccio's plugin loader resolves a
 // scoped package name verbatim as the config key, and both `filters:` and
@@ -42,35 +46,24 @@ const PLUGIN_CONFIG_KEY = '@fortmesa/verdaccio-attestations';
 const OFFLINE_ENFORCER_CONFIG_KEY = '@fortmesa/verdaccio-offline-enforcer';
 
 const ATTESTATIONS_PATH_PREFIX = '/-/npm/v1/attestations/';
-// Only a fallback for a package with no proxy: configured at all -- see
-// _resolveUpstreamRegistryUrls() below for why this isn't used
-// unconditionally. Matches @verdaccio/config's own DEFAULT_REGISTRY
-// constant (confirmed against its source) -- the same default Verdaccio
-// itself falls back to, not a value invented here.
-const DEFAULT_UPSTREAM_REGISTRY = 'https://registry.npmjs.org';
 // filter_metadata() now awaits _resolveVerdict() directly for a
 // never-before-seen version instead of backgrounding it (see that
-// method's own comment on why) -- this bounds the one network call that
-// can add to a metadata read's latency, so a slow/unresponsive upstream
-// can't turn into a hung install instead of a (still fast) block.
+// method's own comment on why) -- this bounds the attestations fetch, so a
+// slow/unresponsive upstream can't turn into a hung install instead of a
+// (still fast) block. sigstore.verify() makes its own network calls too
+// (a TUF trust-root refresh, with its own 5s timeout and 2 retries), which
+// this does not cover.
 const UPSTREAM_FETCH_TIMEOUT_MS = 5000;
+// After an upstream lookup fails (timeout, 5xx, network error, or a TUF
+// refresh failure inside sigstore.verify()), the version is answered as
+// unverified without another network call until this much time has passed.
+// The failure is never cached as a verdict, so the next attempt after the
+// back-off can still succeed.
+const UPSTREAM_RETRY_BACKOFF_MS = 60 * 1000;
+// Redirects getJson() follows, the same limit node-fetch used.
+const MAX_UPSTREAM_REDIRECTS = 20;
 
 const NPM_KEYS_PATH = '/-/npm/v1/keys';
-// Leading "." makes this an invalid, unpublishable npm package name (npm
-// itself rejects a package name starting with "." or "_") -- deliberately so:
-// this is a fake "package name" used purely as this plugin's own storage
-// namespace via the same generic storage.localStorage.addTarball/getTarball
-// interface _readBundle/_storeBundle already use for verdicts, and it must
-// never be reachable by a real publish, which would otherwise let an
-// attacker with publish rights collide with (or overwrite) this plugin's own
-// registry-signing-key storage.
-const REGISTRY_KEYS_NAMESPACE = '.verdaccio-attestations-registry-keys';
-// storage.localStorage has no listing/enumeration capability at all (see
-// _getLocalStorage()'s own comment -- it's a thin addTarball/getTarball/
-// removeTarball wrapper, nothing more), so there is no way to ask "what
-// upstream keys have I already stored" other than tracking that list
-// ourselves, in one more object alongside the per-keyid ones.
-const REGISTRY_KEYS_INDEX_FILENAME = 'index.json';
 // Deliberately not gated behind fetchUpstream, unlike every other upstream
 // call in this plugin: fetchUpstream governs whether THIS plugin verifies
 // SLSA attestations, an opt-in feature. Registry signatures are a completely
@@ -103,9 +96,9 @@ const requestContext = new AsyncLocalStorage();
 // SEPARATE filter-role instance (see the constructor comment on
 // PLUGIN_CONFIG_KEY lookup below) -- both instances live in the same
 // process/module, so a module-level slot is the only thing they share.
-// Without this, any verdict resolved via filter_metadata()'s background
-// path (real fetchUpstream verification, not a same-request local publish)
-// crashes trying to persist on an instance that never received storage --
+// Without this, any verdict resolved via filter_metadata() (real
+// fetchUpstream verification, not a same-request local publish) crashes
+// trying to persist on an instance that never received storage --
 // caught and logged, but silently defeating the entire point of persisting
 // a verdict at all: every such package re-verifies from scratch on every
 // process/replica that hasn't itself already resolved it in memory.
@@ -234,6 +227,84 @@ function splitPkgAtVersion(pkgAtVersion) {
   return {name: pkgAtVersion.slice(0, at), version: pkgAtVersion.slice(at + 1)};
 }
 
+// GETs url with Node's own http/https client and resolves with the part of
+// a fetch() Response this plugin reads: {ok, status, json()}. agentFor(url)
+// picks the agent for each request, so a redirect to another host gets
+// that URL's proxy and TLS settings. A redirect from https to http is
+// refused. signal bounds the whole call, redirects and body included.
+async function getJson(url, {agentFor, signal}) {
+  let current = url;
+  for (let hop = 0; hop <= MAX_UPSTREAM_REDIRECTS; hop += 1) {
+    const res = await new Promise((resolve, reject) => {
+      // Plain http only for an uplink the operator configured as http://,
+      // which Verdaccio's own uplink requests allow too.
+      const client = new URL(current).protocol === 'https:' ? https : http;
+      const options = {
+        agent: agentFor(current),
+        signal,
+        headers: {accept: 'application/json', 'user-agent': PLUGIN_CONFIG_KEY},
+      };
+      const req = client.get(current, options, resolve);
+      req.on('error', reject);
+    });
+    const location = res.headers.location;
+    if ([301, 302, 303, 307, 308].includes(res.statusCode) && location) {
+      res.resume();
+      const next = new URL(location, current);
+      if (
+        new URL(current).protocol === 'https:' &&
+        next.protocol !== 'https:'
+      ) {
+        throw new Error(
+          `refusing redirect from ${current} to ${next.protocol}`,
+        );
+      }
+      current = next.toString();
+      continue;
+    }
+    const body = await readStreamText(res);
+    return {
+      ok: res.statusCode >= 200 && res.statusCode < 300,
+      status: res.statusCode,
+      json: async () => JSON.parse(body),
+    };
+  }
+  throw new Error(`more than ${MAX_UPSTREAM_REDIRECTS} redirects from ${url}`);
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Splits a request path into its package name and the segments after it.
+// Verdaccio's own encodeScopePackage middleware turns "/@scope/pkg/..." into
+// "/@scope%2Fpkg/..." before its router runs, but that happens after this
+// plugin's middlewares, so both forms are handled here. Returns null for a
+// path with no package segment or with invalid percent-encoding.
+function splitPackagePath(reqPath) {
+  const segments = reqPath.replace(/\/%40/, '/@').split('/').filter(Boolean);
+  if (segments.length === 0) return null;
+  let nameSegments = 1;
+  if (
+    segments.length >= 2 &&
+    segments[0].startsWith('@') &&
+    !segments[0].includes('%')
+  ) {
+    nameSegments = 2;
+  }
+  try {
+    return {
+      packageName: segments
+        .slice(0, nameSegments)
+        .map(decodeURIComponent)
+        .join('/'),
+      rest: segments.slice(nameSegments).map(decodeURIComponent),
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Rejects anything that could let name/version escape a single logical
 // storage key/path segment once handed to attestationFilename() below --
 // checked here, in this plugin's own code, rather than trusted to whatever
@@ -295,15 +366,39 @@ function deriveVersionFromTarballFilename(packageName, filename) {
   return filename.slice(prefix.length, -'.tgz'.length);
 }
 
-// Nearest older non-blocked version, falling back to nearest newer, then
-// null (caller hard-removes) if nothing is available -- same substitute
-// algorithm verdaccio-security-filter's strategy:'replace' already uses.
+// Nearest older candidate, falling back to nearest newer, then null (caller
+// hard-removes) if there is none -- same substitute algorithm
+// verdaccio-security-filter's strategy:'replace' already uses. available
+// must be valid semver, sorted ascending; a ver that isn't valid semver gets
+// no substitute.
 function pickReplacementSubstitute(ver, available) {
+  if (!semver.valid(ver)) return null;
   const older = available.filter(v => semver.lt(v, ver));
   if (older.length > 0) return older[older.length - 1];
   const newer = available.filter(v => semver.gt(v, ver));
   if (newer.length > 0) return newer[0];
   return null;
+}
+
+// Points every dist-tag whose version is gone at the newest remaining
+// stable version (or the newest remaining at all), or drops the tag if
+// nothing remains. available must be valid semver, sorted ascending.
+function repointDistTags(packageInfo, available) {
+  const availableStable = available.filter(v => semver.prerelease(v) === null);
+  const distTags = packageInfo['dist-tags'] ?? {};
+  for (const tag of Object.keys(distTags)) {
+    if (distTags[tag] in (packageInfo.versions ?? {})) continue;
+    const candidates = availableStable.length > 0 ? availableStable : available;
+    if (candidates.length > 0) {
+      distTags[tag] = candidates[candidates.length - 1];
+    } else {
+      delete distTags[tag];
+    }
+  }
+}
+
+function sortedValidVersions(versions) {
+  return versions.filter(v => semver.valid(v)).sort(semver.compare);
 }
 
 class Attestations {
@@ -354,12 +449,11 @@ class Attestations {
     }
     this.signingKeys = loadSigningKeys(this.sigstoreOptions.signingKeys ?? []);
 
-    // keyid -> {keyid, expires, keytype, scheme, key}, relayed from every
-    // configured uplink's own GET /-/npm/v1/keys -- see
-    // _refreshUpstreamKeys() below. Warm-started from persisted storage in
-    // register_middlewares(), not here: this constructor has no storage/auth
-    // handle yet (see the sharedStorage/sharedAuth comment above for why
-    // those only arrive via register_middlewares).
+    // keyid -> {source, entry}, where entry is {keyid, expires, keytype,
+    // scheme, key} relayed from an uplink's own GET /-/npm/v1/keys and
+    // source is that uplink's URL -- see _refreshUpstreamKeys() below.
+    // In memory only, filled by the refresh that runs at startup and then on
+    // an interval.
     this._upstreamKeysCache = options.upstreamKeysCache ?? new Map();
     this._upstreamKeysRefreshTimer = null;
 
@@ -393,10 +487,19 @@ class Attestations {
     this._offlineEnforceForUnknown =
       offlineEnforcerConfig?.enforceForUnknown ?? false;
 
-    // "name@version" -> {verified, reason, predicateType}. Populated once
-    // per pod lifetime -- backed by _readStoredVerdict()'s persisted
-    // object for anything that survives a restart.
+    // "name@version" -> {verified, reason, integrity}. Holds real verdicts
+    // only: a cryptographic outcome, or "no attestation upstream". Anything
+    // that depends on the request or on the network being up ("no
+    // integrity", "fetchUpstream off or offline-restricted", a failed
+    // fetch) is answered per call and never cached. integrity is the
+    // dist.integrity the verdict was computed for, so a version whose
+    // tarball changes is checked again. Backed by _readStoredVerdict()'s
+    // persisted object for anything that survives a restart.
     this._verdictCache = options.verdictCache ?? new Map();
+
+    // "name@version" -> timestamp before which an upstream lookup that just
+    // failed is not retried. See UPSTREAM_RETRY_BACKOFF_MS.
+    this._upstreamRetryAt = new Map();
 
     this._parseJsonBody = bodyParser.json({
       strict: false,
@@ -404,14 +507,12 @@ class Attestations {
     });
 
     // Test-only: inject a fake fetch so tests never make a real network call.
-    this._fetch = options.fetch ?? nodeFetch;
+    this._fetch = options.fetch ?? getJson;
 
-    // "name@version" -> in-flight background verification Promise, for the
-    // duration of that verification only (removed once it settles either
-    // way). Never consulted by real request handling -- filter_metadata()
-    // fires these and moves on -- but lets a test await
-    // whenAllBackgroundWorkSettles() instead of guessing a timeout for
-    // sigstore.verify()'s own (real, sometimes network-bound) work to finish.
+    // Key -> in-flight background Promise (publish-time verdict writes and
+    // the registry keys refresh), removed once it settles. Real request
+    // handling never consults it; it lets a test await
+    // whenAllBackgroundWorkSettles() instead of guessing a timeout.
     this._pendingBackground = new Map();
   }
 
@@ -439,9 +540,9 @@ class Attestations {
   //
   // Awaits the real resolution (_resolveVerdict(), which may include a
   // bounded-timeout upstream fetch -- see UPSTREAM_FETCH_TIMEOUT_MS on
-  // _fetchFromUpstream() below) for any version the fast tier (packument-
-  // embedded verdict, in-memory cache, or a single persisted-storage read)
-  // doesn't already have an answer for. This used to fail closed
+  // _fetchFromUpstream() below) for any version the fast tier (in-memory
+  // cache, or a single persisted-storage read) doesn't already have an
+  // answer for. This used to fail closed
   // immediately on a never-before-seen version and resolve it in the
   // background instead -- deliberately changed: the very first read of any
   // given version was *guaranteed* wrong (blocked, even for a package that
@@ -454,17 +555,54 @@ class Attestations {
   // waits for the slowest one to finish instead of returning early.
   async filter_metadata(packageInfo) {
     if (this.blockRules.length === 0) return packageInfo; // disabled
+    try {
+      return await this._filterMetadata(packageInfo);
+    } catch (err) {
+      // Verdaccio's _applyFilters() catches a filter's throw and carries on
+      // with the packument it passed in, unfiltered -- a throw here would
+      // serve every gated version. Remove them instead.
+      this.logger.error(
+        {pkg: packageInfo?.name, err: err?.message},
+        'verdaccio-attestations: filter failed, removing every version a block rule covers (@{err})',
+      );
+      return this._removeGatedVersions(packageInfo);
+    }
+  }
 
-    const versions = packageInfo.versions ?? {};
-    const versionEntries = Object.keys(versions);
-
-    const gated = versionEntries.filter(ver => {
+  _gatedVersions(packageInfo) {
+    return Object.keys(packageInfo.versions ?? {}).filter(ver => {
       if (findMatchingRules(this.allowRules, packageInfo.name, ver).length > 0)
         return false;
       return (
         findMatchingRules(this.blockRules, packageInfo.name, ver).length > 0
       );
     });
+  }
+
+  _removeGatedVersions(packageInfo) {
+    if (!isPlainObject(packageInfo?.versions)) return packageInfo;
+    let gated;
+    try {
+      gated = this._gatedVersions(packageInfo);
+    } catch {
+      gated = Object.keys(packageInfo.versions);
+    }
+    for (const ver of gated) {
+      delete packageInfo.versions[ver];
+      delete packageInfo.time?.[ver];
+    }
+    repointDistTags(
+      packageInfo,
+      sortedValidVersions(Object.keys(packageInfo.versions)),
+    );
+    return packageInfo;
+  }
+
+  async _filterMetadata(packageInfo) {
+    const versions = packageInfo.versions ?? {};
+    const versionEntries = Object.keys(versions);
+
+    const gated = this._gatedVersions(packageInfo);
     if (gated.length === 0) return packageInfo;
 
     const fastResults = await Promise.all(
@@ -505,20 +643,35 @@ class Attestations {
 
     if (blocked.size === 0) return packageInfo;
 
-    const available = versionEntries
-      .filter(v => !blocked.has(v))
-      .sort((a, b) => semver.compare(a, b));
-    const availableStable = available.filter(
-      v => semver.prerelease(v) === null,
+    const available = sortedValidVersions(
+      versionEntries.filter(v => !blocked.has(v)),
+    );
+    // A substitute must be attested content, so only versions this call
+    // gated and verified qualify -- never one no rule covered and nothing
+    // checked.
+    const verifiedSubstitutes = sortedValidVersions(
+      gated.filter((ver, i) => verdicts[i].verified),
     );
 
     for (const ver of blocked) {
       if (replaceRequested.has(ver)) {
-        const substitute = pickReplacementSubstitute(ver, available);
+        const substitute = pickReplacementSubstitute(ver, verifiedSubstitutes);
         if (substitute) {
+          // The substitute's signatures and attestations name the
+          // substitute's own version, so copied under ver they would fail
+          // `npm audit signatures` and the attestation subject check.
+          const record = packageInfo.versions[substitute];
+          const dist = isPlainObject(record.dist)
+            ? {...record.dist}
+            : undefined;
+          if (dist) {
+            delete dist.signatures;
+            delete dist.attestations;
+          }
           packageInfo.versions[ver] = {
-            ...packageInfo.versions[substitute],
+            ...record,
             version: ver,
+            ...(dist ? {dist} : {}),
           };
           this.logger.warn(
             {pkg: packageInfo.name, ver, substitutedWith: substitute},
@@ -535,34 +688,42 @@ class Attestations {
       delete packageInfo.time?.[ver];
     }
 
-    const distTags = packageInfo['dist-tags'] ?? {};
-    for (const tag of Object.keys(distTags)) {
-      if (distTags[tag] in packageInfo.versions) continue;
-      const candidates =
-        availableStable.length > 0 ? availableStable : available;
-      if (candidates.length > 0) {
-        distTags[tag] = candidates[candidates.length - 1];
-      } else {
-        delete distTags[tag];
-      }
-    }
-
+    repointDistTags(packageInfo, available);
     return packageInfo;
   }
 
-  // Synchronous, zero-I/O check: an internally-published package's own
-  // stored verdict (already sitting in the metadata handed in) or this
-  // pod's in-memory cache. Returns undefined -- a real sentinel, not just
-  // a falsy verified:false -- when neither has an answer, so callers can
+  // Synchronous, zero-I/O check of this pod's in-memory cache. Returns
+  // undefined -- a real sentinel, not just a falsy verified:false -- when it
+  // has no answer for this version's current dist.integrity, so callers can
   // tell "known unverified" apart from "never checked at all".
+  //
+  // Never reads dist.attestations.verified from the packument: whoever
+  // publishes a version writes its metadata, so a publisher could set that
+  // field to true on a version with no provenance at all.
   _peekVerdict(name, version, versionMeta) {
-    if (versionMeta.dist?.attestations?.verified !== undefined) {
-      return {
-        verified: versionMeta.dist.attestations.verified,
-        reason: versionMeta.dist.attestations.reason,
-      };
+    const cached = this._verdictCache.get(`${name}@${version}`);
+    if (!cached || cached.integrity !== versionMeta?.dist?.integrity) {
+      return undefined;
     }
-    return this._verdictCache.get(`${name}@${version}`);
+    return {verified: cached.verified, reason: cached.reason};
+  }
+
+  // True while key is inside the back-off that follows a transient
+  // failure; clears the entry once the back-off has passed.
+  _inRetryBackoff(key) {
+    const retryAt = this._upstreamRetryAt.get(key);
+    if (retryAt === undefined) return false;
+    if (Date.now() < retryAt) return true;
+    this._upstreamRetryAt.delete(key);
+    return false;
+  }
+
+  _cacheVerdict(name, version, integrity, result) {
+    this._verdictCache.set(`${name}@${version}`, {
+      verified: result.verified,
+      reason: result.reason,
+      integrity,
+    });
   }
 
   // Adds exactly one persisted-storage read on top of _peekVerdict() --
@@ -575,70 +736,124 @@ class Attestations {
     const cached = this._peekVerdict(name, version, versionMeta);
     if (cached !== undefined) return cached;
 
+    // A stored verdict counts only for the integrity it was computed
+    // against. Objects written before verdicts recorded their integrity
+    // (1.1.x and earlier) match nothing and are resolved again.
+    const integrity = versionMeta?.dist?.integrity;
     const stored = await this._readStoredVerdict(name, version);
-    if (!stored) return undefined;
+    if (
+      !stored ||
+      stored.transient ||
+      !integrity ||
+      stored.integrity !== integrity
+    ) {
+      return undefined;
+    }
     const result = {verified: stored.verified, reason: stored.reason};
-    this._verdictCache.set(`${name}@${version}`, result);
+    this._cacheVerdict(name, version, integrity, result);
     return result;
   }
 
   // The full resolution, including (if fetchUpstream allows it) a live
   // upstream fetch and real cryptographic verification -- the only
-  // expensive path in this plugin, and the only one ever run in the
-  // background rather than awaited inline from filter_metadata().
+  // expensive path in this plugin, awaited inline from filter_metadata().
   async _resolveVerdict(name, version, versionMeta) {
     const fast = await this._resolveVerdictFast(name, version, versionMeta);
     if (fast !== undefined) return fast;
 
     const key = `${name}@${version}`;
-    const integrity = versionMeta.dist?.integrity;
+    const integrity = versionMeta?.dist?.integrity;
+    // The three answers below are not verdicts, so none is cached or
+    // persisted: "no integrity" reflects incomplete input, "fetchUpstream
+    // off or offline-restricted" can depend on this one request's identity,
+    // and a failed lookup can succeed on a later try.
     if (!integrity) {
-      // Deliberately not persisted -- this reflects incomplete input (no
-      // integrity to check against yet), not a real verification failure,
-      // and a later call might have real data.
-      const result = {
+      return {
         verified: false,
         reason: 'no dist.integrity available to verify against',
       };
-      this._verdictCache.set(key, result);
-      return result;
+    }
+
+    if (this._inRetryBackoff(key)) {
+      return {
+        verified: false,
+        reason:
+          'attestation verification failed recently for a transient reason -- not retried until the back-off passes',
+      };
+    }
+
+    // A bundle stored by a local publish whose verification couldn't finish
+    // is checked again here. No uplink is involved, so fetchUpstream
+    // doesn't apply.
+    const stored = await this._readStoredVerdict(name, version);
+    if (stored?.transient && stored.bundle && stored.integrity === integrity) {
+      const recheck = await verifyBundle(
+        {name, version, integrity},
+        stored.bundle,
+        this.sigstoreOptions,
+        stored.identityChecked && this.trustedPublishers.length > 0
+          ? this.trustedPublishers
+          : null,
+      );
+      if (recheck.transient) {
+        this._upstreamRetryAt.set(key, Date.now() + UPSTREAM_RETRY_BACKOFF_MS);
+        return {verified: false, reason: recheck.reason};
+      }
+      this._cacheVerdict(name, version, integrity, recheck);
+      return recheck;
     }
 
     if (!this._effectiveFetchUpstream()) {
-      // Also deliberately not persisted -- this may only reflect this one
-      // request's identity being offline-restricted, or fetchUpstream might
-      // get turned on later either way -- this shouldn't calcify into a
-      // permanent bad record.
-      const result = {
+      return {
         verified: false,
         reason:
           'fetchUpstream is disabled (or this request is offline-restricted) -- cannot verify a proxied package without contacting the real registry',
       };
-      this._verdictCache.set(key, result);
-      return result;
     }
 
-    const attestationsResponse = await this._fetchFromUpstream(name, version);
-    const result = attestationsResponse
-      ? await verifyAttestationsResponse(
-          {name, version, integrity},
-          attestationsResponse,
-          this.sigstoreOptions,
-        )
-      : {
-          verified: false,
-          reason:
-            'no attestation available (not published here, not found upstream)',
-        };
+    const fetched = await this._fetchFromUpstream(name, version);
+    if (fetched.status === 'error') {
+      this._upstreamRetryAt.set(key, Date.now() + UPSTREAM_RETRY_BACKOFF_MS);
+      return {
+        verified: false,
+        reason:
+          'upstream attestation lookup failed (see the warning logged for it)',
+      };
+    }
 
-    this._verdictCache.set(key, result);
+    const result =
+      fetched.status === 'ok'
+        ? await verifyAttestationsResponse(
+            {name, version, integrity},
+            fetched.body,
+            this.sigstoreOptions,
+          )
+        : {
+            verified: false,
+            reason:
+              'no attestation available (not published here, not found upstream)',
+          };
+
+    // sigstore.verify() could not finish (TUF refresh or another
+    // infrastructure failure), so this says nothing about the bundle.
+    if (result.transient) {
+      this._upstreamRetryAt.set(key, Date.now() + UPSTREAM_RETRY_BACKOFF_MS);
+      return {verified: false, reason: result.reason};
+    }
+
+    this._cacheVerdict(name, version, integrity, result);
     if (result.bundle) {
-      this._storeVerdictAndBundle(name, version, result.bundle, result).catch(
-        err =>
-          this.logger.warn(
-            {pkg: name, ver: version, err: err.message},
-            'verdaccio-attestations: failed to persist verdict',
-          ),
+      this._storeVerdictAndBundle(
+        name,
+        version,
+        integrity,
+        result.bundle,
+        result,
+      ).catch(err =>
+        this.logger.warn(
+          {pkg: name, ver: version, err: err.message},
+          'verdaccio-attestations: failed to persist verdict',
+        ),
       );
     }
     return result;
@@ -656,21 +871,55 @@ class Attestations {
   async _readStoredVerdict(name, version) {
     if (!this._getLocalStorage()) return null;
     try {
-      const {verified, bundle, reason} = await this._readBundle(
+      const stored = await this._readBundle(
         name,
         attestationFilename(name, version),
       );
-      return {verified, bundle, reason};
+      if (!isPlainObject(stored) || typeof stored.verified !== 'boolean') {
+        return null;
+      }
+      const {verified, bundle, reason, integrity, transient, identityChecked} =
+        stored;
+      return {
+        verified,
+        bundle,
+        reason,
+        integrity,
+        transient: transient === true,
+        identityChecked: identityChecked === true,
+      };
     } catch {
       return null; // no object yet, or no persistent storage -- never resolved
     }
   }
 
-  _storeVerdictAndBundle(name, version, bundle, result) {
+  // identityChecked records whether trustedPublishers applied when the
+  // bundle was checked (a local publish with trustedPublishers configured),
+  // so a transient object's later re-check applies the same rule.
+  _storeVerdictAndBundle(
+    name,
+    version,
+    integrity,
+    bundle,
+    result,
+    {identityChecked = false} = {},
+  ) {
     if (!this._getLocalStorage()) return Promise.resolve(); // in-memory-only fallback -- nothing to persist to
-    const content = result.verified
-      ? {verified: true, bundle}
-      : {verified: false, bundle, reason: result.reason};
+    let content;
+    if (result.verified) {
+      content = {verified: true, integrity, bundle};
+    } else if (result.transient) {
+      content = {
+        verified: false,
+        transient: true,
+        identityChecked,
+        integrity,
+        bundle,
+        reason: result.reason,
+      };
+    } else {
+      content = {verified: false, integrity, bundle, reason: result.reason};
+    }
     return this._storeBundle(name, attestationFilename(name, version), content);
   }
 
@@ -744,17 +993,53 @@ class Attestations {
     return !ctx.offlineRestricted;
   }
 
-  // Mirrors verdaccio-audit's ProxyAudit exactly: a plain HTTPS agent by
-  // default (with strict_ssl controlling certificate validation), replaced
-  // by an HttpsProxyAgent when auth.config.https_proxy is set, so this
-  // plugin behaves the same way in a firewalled/corporate deployment that
-  // routes all outbound npmjs traffic through a specific proxy.
-  _requestAgent() {
+  // Mirrors verdaccio-audit's ProxyAudit: a plain HTTPS agent by default
+  // (with strict_ssl controlling certificate validation), replaced by an
+  // HttpsProxyAgent when auth.config.https_proxy is set, so this plugin
+  // behaves the same way in a firewalled/corporate deployment that routes
+  // all outbound npmjs traffic through a specific proxy. An http:// uplink
+  // gets a plain http.Agent: Node rejects an https.Agent for one with
+  // ERR_INVALID_PROTOCOL.
+  _requestAgent(url) {
+    if (new URL(url).protocol !== 'https:') return new http.Agent();
     const auth = this._getAuth();
     if (auth?.config?.https_proxy) {
       return new HttpsProxyAgent(auth.config.https_proxy);
     }
     return new https.Agent({rejectUnauthorized: this.strictSsl});
+  }
+
+  // Verdaccio checks publish permission only in its own router, which runs
+  // after every plugin middleware. Asking it first keeps a PUT from someone
+  // who can't publish this package away from verification, the verdict
+  // cache and the network. No auth handle means no.
+  _canPublish(req, packageName, packageVersion) {
+    const auth = this._getAuth();
+    if (typeof auth?.allow_publish !== 'function' || !req.remote_user) {
+      return Promise.resolve(false);
+    }
+    return new Promise(resolve => {
+      auth.allow_publish(
+        {packageName, packageVersion},
+        req.remote_user,
+        (err, ok) => resolve(!err && ok === true),
+      );
+    });
+  }
+
+  // Same check Verdaccio's own GET /:package runs (can('access')). Resolves
+  // to null when allowed, or the denial error (whose .status Verdaccio
+  // sets) when not.
+  _accessDenial(req, packageName) {
+    const auth = this._getAuth();
+    if (typeof auth?.allow_access !== 'function' || !req.remote_user) {
+      return Promise.resolve({status: 403});
+    }
+    return new Promise(resolve => {
+      auth.allow_access({packageName}, req.remote_user, (err, ok) =>
+        resolve(err ? err : ok === true ? null : {status: 403}),
+      );
+    });
   }
 
   // Verdaccio's own config -- not a hardcoded assumption -- decides where a
@@ -771,46 +1056,56 @@ class Attestations {
   // silently checking attestations for a different build of the package
   // than the one this instance is actually serving, and unconditionally
   // reaching out to the public npm registry defeats the entire point of an
-  // otherwise fully air-gapped uplink. Falls back to DEFAULT_UPSTREAM_REGISTRY
-  // only when a package genuinely has no proxy configured at all -- the
-  // same fallback Verdaccio's own DEFAULT_REGISTRY/DEFAULT_UPLINK constants
-  // already default to, not a value this plugin invents on its own.
+  // otherwise fully air-gapped uplink. A package with no proxy configured
+  // gets no URLs at all: Verdaccio contacts no uplink for it, and sending
+  // its name to the public registry would leak a private package's name
+  // (fm-npmjs's "@fortmesa/*" has no proxy on purpose).
   _resolveUpstreamRegistryUrls(name) {
     const config = this._getAuth()?.config;
     const matched = config?.getMatchedPackagesSpec?.(name);
     const proxyNames = matched?.proxy ? [].concat(matched.proxy) : [];
-    const urls = proxyNames
+    return proxyNames
       .map(uplinkName => config?.uplinks?.[uplinkName]?.url)
       .filter(Boolean);
-    return urls.length > 0 ? urls : [DEFAULT_UPSTREAM_REGISTRY];
   }
 
+  // Returns {status: 'ok', body} for the first uplink that has the
+  // attestations, {status: 'absent'} when every uplink answered 404 (or
+  // there is no uplink, or the version isn't valid semver), and
+  // {status: 'error'} when any uplink failed some other way (timeout, 5xx,
+  // network error, bad JSON) and none had them. Never throws.
   async _fetchFromUpstream(name, version) {
+    // The version goes into the upstream URL path. Requiring valid semver
+    // and encoding it keeps a crafted one ("1\..\..\x", which the URL
+    // parser turns into "../x") from reaching any other path on the uplink.
+    if (!semver.valid(version)) return {status: 'absent'};
+    let failed = false;
     for (const registryUrl of this._resolveUpstreamRegistryUrls(name)) {
+      const url = `${registryUrl.replace(/\/$/, '')}${ATTESTATIONS_PATH_PREFIX}${encodeURIComponent(name)}@${encodeURIComponent(version)}`;
       try {
-        const res = await this._fetch(
-          `${registryUrl.replace(/\/$/, '')}${ATTESTATIONS_PATH_PREFIX}${encodeURIComponent(name)}@${version}`,
-          {
-            agent: this._requestAgent(),
-            // filter_metadata() now awaits this call directly (see its own
-            // comment on why) rather than backgrounding it -- an unbounded
-            // fetch here would turn a slow/unresponsive upstream into a
-            // hung metadata read instead of the wrong-but-fast answer this
-            // used to give. A timeout (same treatment as any other fetch
-            // failure: logged, treated as "no attestation", never thrown
-            // past this method) bounds that without needing new config.
-            signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
-          },
+        const res = await this._fetch(url, {
+          agentFor: requestUrl => this._requestAgent(requestUrl),
+          // filter_metadata() awaits this call directly (see its own comment
+          // on why), so an unbounded fetch would turn a slow upstream into a
+          // hung metadata read. The timeout counts as a failed lookup.
+          signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
+        });
+        if (res.ok) return {status: 'ok', body: await res.json()};
+        if (res.status === 404) continue;
+        failed = true;
+        this.logger.warn(
+          {pkg: name, ver: version, registryUrl, status: res.status},
+          'verdaccio-attestations: upstream answered HTTP @{status} for an attestation lookup',
         );
-        if (res.ok) return await res.json();
       } catch (err) {
+        failed = true;
         this.logger.warn(
           {pkg: name, ver: version, registryUrl, err: err.message},
           'verdaccio-attestations: failed to fetch attestation from upstream',
         );
       }
     }
-    return null;
+    return {status: failed ? 'error' : 'absent'};
   }
 
   // Every distinct configured uplink's own URL -- deliberately not scoped to
@@ -826,51 +1121,13 @@ class Attestations {
       .filter(Boolean);
   }
 
-  async _readRegistryKeysIndex() {
-    try {
-      return await this._readBundle(
-        REGISTRY_KEYS_NAMESPACE,
-        REGISTRY_KEYS_INDEX_FILENAME,
-      );
-    } catch {
-      return {keyids: []}; // never written yet, or no persistent storage
-    }
-  }
-
-  // Warm start: populates the in-memory cache from whatever was already
-  // persisted before this process started, so GET /-/npm/v1/keys has
-  // real answers immediately rather than an empty list until the first
-  // refresh cycle completes. No-op (not an error) when no persistent
-  // storage is reachable at all -- same in-memory-only degradation every
-  // other storage-backed feature in this plugin already falls back to.
-  async _loadUpstreamKeysFromStorage() {
-    if (!this._getLocalStorage()) return;
-    const index = await this._readRegistryKeysIndex();
-    for (const keyid of index.keyids ?? []) {
-      try {
-        const entry = await this._readBundle(
-          REGISTRY_KEYS_NAMESPACE,
-          keyStorageFilename(keyid),
-        );
-        this._upstreamKeysCache.set(keyid, entry);
-      } catch (err) {
-        this.logger.warn(
-          {keyid, err: err.message},
-          'verdaccio-attestations: failed to load stored upstream registry key @{keyid}',
-        );
-      }
-    }
-  }
-
   async _fetchUpstreamKeysFrom(registryUrl) {
+    const url = `${registryUrl.replace(/\/$/, '')}${NPM_KEYS_PATH}`;
     try {
-      const res = await this._fetch(
-        `${registryUrl.replace(/\/$/, '')}${NPM_KEYS_PATH}`,
-        {
-          agent: this._requestAgent(),
-          signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
-        },
-      );
+      const res = await this._fetch(url, {
+        agentFor: requestUrl => this._requestAgent(requestUrl),
+        signal: AbortSignal.timeout(UPSTREAM_FETCH_TIMEOUT_MS),
+      });
       if (!res.ok) return [];
       return normalizeUpstreamKeysResponse(await res.json());
     } catch (err) {
@@ -882,64 +1139,51 @@ class Attestations {
     }
   }
 
-  // Refreshes the in-memory cache (and persists whatever's new/changed) from
-  // every configured uplink's own GET /-/npm/v1/keys. A key already known
-  // with identical contents is neither re-persisted nor counted as an index
-  // change -- upstream signing keys rotate on the order of months to years,
-  // so in the ordinary case this is a no-op past the very first cycle.
+  // Refreshes the in-memory cache from every configured uplink's own GET
+  // /-/npm/v1/keys. A client looks a signature's key up by keyid alone and
+  // takes the first match, so two rules keep one source from answering for
+  // another: a keyid this registry signs with is never taken from an
+  // uplink, and a keyid already supplied by one uplink is refused from any
+  // other (a warning is logged; the first source keeps it until restart).
   async _refreshUpstreamKeys() {
     const urls = this._configuredUplinkUrls();
     if (urls.length === 0) return;
 
-    const fetched = (
-      await Promise.all(urls.map(url => this._fetchUpstreamKeysFrom(url)))
-    ).flat();
+    const fetchedBySource = await Promise.all(
+      urls.map(async url => ({
+        source: url,
+        entries: await this._fetchUpstreamKeysFrom(url),
+      })),
+    );
+    const ownKeyids = new Set(this.signingKeys.map(key => key.keyid));
 
-    const index = await this._readRegistryKeysIndex();
-    const knownKeyids = new Set(index.keyids ?? []);
-    let indexChanged = false;
-
-    for (const entry of fetched) {
-      const existing = this._upstreamKeysCache.get(entry.keyid);
-      if (existing && JSON.stringify(existing) === JSON.stringify(entry)) {
-        continue; // unchanged -- skip a redundant persisted write
-      }
-      this._upstreamKeysCache.set(entry.keyid, entry);
-      if (this._getLocalStorage()) {
-        await this._storeBundle(
-          REGISTRY_KEYS_NAMESPACE,
-          keyStorageFilename(entry.keyid),
-          entry,
-        ).catch(err =>
+    for (const {source, entries} of fetchedBySource) {
+      for (const entry of entries) {
+        if (ownKeyids.has(entry.keyid)) {
           this.logger.warn(
-            {keyid: entry.keyid, err: err.message},
-            'verdaccio-attestations: failed to persist upstream registry key @{keyid}',
-          ),
-        );
+            {keyid: entry.keyid, source},
+            "verdaccio-attestations: uplink @{source} offered keyid @{keyid}, which is one of this registry's own signing keys -- ignored",
+          );
+          continue;
+        }
+        const existing = this._upstreamKeysCache.get(entry.keyid);
+        if (existing && existing.source !== source) {
+          if (existing.entry.key !== entry.key) {
+            this.logger.warn(
+              {keyid: entry.keyid, source, keptFrom: existing.source},
+              'verdaccio-attestations: uplink @{source} offered a different key for keyid @{keyid} than @{keptFrom} did -- ignored',
+            );
+          }
+          continue;
+        }
+        this._upstreamKeysCache.set(entry.keyid, {source, entry});
       }
-      if (!knownKeyids.has(entry.keyid)) {
-        knownKeyids.add(entry.keyid);
-        indexChanged = true;
-      }
-    }
-
-    if (indexChanged && this._getLocalStorage()) {
-      await this._storeBundle(
-        REGISTRY_KEYS_NAMESPACE,
-        REGISTRY_KEYS_INDEX_FILENAME,
-        {keyids: [...knownKeyids]},
-      ).catch(err =>
-        this.logger.warn(
-          {err: err.message},
-          'verdaccio-attestations: failed to persist upstream registry keys index',
-        ),
-      );
     }
   }
 
   // Runs once immediately (so a freshly-started pod doesn't wait a full
-  // interval before GET /-/npm/v1/keys has any upstream keys at all beyond
-  // whatever warm-started from storage), then on a fixed interval. unref()'d
+  // interval before GET /-/npm/v1/keys has any upstream keys at all), then
+  // on a fixed interval. unref()'d
   // so this timer alone never keeps a process (or a test run) alive -- same
   // idiom verdaccio-security-filter's own OSV sync loop already uses. Guarded
   // against double-start since register_middlewares() runs once per plugin
@@ -972,20 +1216,6 @@ class Attestations {
     sharedStorage = storage;
     sharedAuth = auth;
 
-    // Warm-start the in-memory upstream-keys cache from whatever's already
-    // persisted, then start the ongoing refresh loop -- see both methods'
-    // own comments above. Tracked via _trackBackground like every other
-    // background write in this plugin, so a test can await it via
-    // whenAllBackgroundWorkSettles() instead of guessing a timeout.
-    this._trackBackground(
-      'load-stored-registry-keys',
-      this._loadUpstreamKeysFromStorage().catch(err =>
-        this.logger.warn(
-          {err: err.message},
-          'verdaccio-attestations: failed to warm-start stored upstream registry keys',
-        ),
-      ),
-    );
     this._startUpstreamKeysRefreshLoop();
 
     // Unconditional and first: establishes this request's offline-
@@ -1022,31 +1252,17 @@ class Attestations {
     // whatever an earlier plugin (verdaccio-security-filter,
     // verdaccio-oidc-auth, or any third-party one following the same
     // contract) already populated.
+    //
+    // The reading itself is this plugin's own body-parser instance, which
+    // attaches its listener synchronously, parses only application/json
+    // (the same type Verdaccio's parser takes), stops at max_body_size with
+    // a 413, and answers malformed JSON with a 400. A listener on the
+    // request's own 'end' event runs outside the AsyncLocalStorage context
+    // the middleware above set up; raw-body (under body-parser) binds its
+    // callback to the caller's context, so next() still runs inside it.
     app.use((req, res, next) => {
-      if (req._body) return next();
-      const contentEncoding = (req.headers['content-encoding'] || '')
-        .trim()
-        .toLowerCase();
-      if (
-        req.method !== 'PUT' ||
-        !/json/i.test(req.headers['content-type'] || '') ||
-        (contentEncoding !== '' && contentEncoding !== 'identity')
-      ) {
-        return next();
-      }
-      const chunks = [];
-      req.on('data', chunk => chunks.push(chunk));
-      req.on('end', () => {
-        const raw = Buffer.concat(chunks);
-        try {
-          req.body = raw.length > 0 ? JSON.parse(raw.toString('utf8')) : {};
-        } catch (err) {
-          return next(err);
-        }
-        req._body = true;
-        next();
-      });
-      req.on('error', err => next(err));
+      if (req._body || req.method !== 'PUT') return next();
+      this._parseJsonBody(req, res, next);
     });
 
     app.use((req, res, next) => {
@@ -1055,14 +1271,20 @@ class Attestations {
       // populates req.params.package) even mounts -- parse the name from
       // the path directly, same as verdaccio-security-filter's own
       // publish-time gate already has to.
-      const segments = req.path
-        .replace(/\/%40/, '/@')
-        .split('/')
-        .filter(Boolean);
-      if (segments.length === 0 || segments.length > 2 || segments[1] === '-')
-        return next();
-      const packageName = decodeURIComponent(segments[0]);
-
+      const parsed = splitPackagePath(req.path);
+      if (!parsed) return next();
+      const {packageName, rest} = parsed;
+      // Verdaccio's PUT /:package/-/:filename/* stores whatever filename a
+      // publisher uploads. A "<name>-<version>.attestation" file is this
+      // plugin's stored verdict, so a client must never write one.
+      if (rest[0] === '-' && rest[1]?.endsWith('.attestation')) {
+        return res.status(403).json({
+          error:
+            'verdaccio-attestations: .attestation files are written by the registry, not uploaded',
+        });
+      }
+      if (rest.length > 1 || rest[0] === '-') return next();
+      if (!isSafePackageName(packageName)) return next();
       this._parseJsonBody(req, res, err => {
         if (err) {
           // raw-body's own error carries expected/received/type properties
@@ -1084,7 +1306,26 @@ class Attestations {
           );
           return next(err);
         }
-        this._interceptPublish(req, res, packageName).finally(() => next());
+        const attachments = req.body?._attachments;
+        if (
+          isPlainObject(attachments) &&
+          Object.keys(attachments).some(k => k.endsWith('.attestation'))
+        ) {
+          return res.status(403).json({
+            error:
+              'verdaccio-attestations: .attestation files are written by the registry, not uploaded',
+          });
+        }
+        this._handlePublish(req, res, packageName).then(
+          () => next(),
+          handlerErr => {
+            this.logger.error(
+              {pkg: packageName, err: handlerErr?.message},
+              'verdaccio-attestations: publish handling failed (@{err})',
+            );
+            next(handlerErr);
+          },
+        );
       });
     });
 
@@ -1102,18 +1343,20 @@ class Attestations {
     // exceed it.
     app.use((req, res, next) => {
       if (req.method !== 'DELETE') return next();
-      const segments = req.path
-        .replace(/\/%40/, '/@')
-        .split('/')
-        .filter(Boolean);
-      if (
-        segments.length !== 5 ||
-        segments[1] !== '-' ||
-        segments[3] !== '-rev'
-      )
+      const parsed = splitPackagePath(req.path);
+      if (!parsed) return next();
+      const {packageName, rest} = parsed;
+      if (rest.length !== 4 || rest[0] !== '-' || rest[2] !== '-rev')
         return next();
-      const packageName = decodeURIComponent(segments[0]);
-      const filename = decodeURIComponent(segments[2]);
+      const filename = rest[1];
+      // The stored verdict is the registry's to remove (below, alongside
+      // its tarball), never a client's.
+      if (filename.endsWith('.attestation')) {
+        return res.status(403).json({
+          error:
+            'verdaccio-attestations: .attestation files are removed by the registry, not deleted directly',
+        });
+      }
       const version = deriveVersionFromTarballFilename(packageName, filename);
       if (!version) return next();
 
@@ -1123,6 +1366,7 @@ class Attestations {
       // cleanup for a tarball that's still actually there.
       res.on('finish', () => {
         if (res.statusCode >= 300) return;
+        this._verdictCache.delete(`${packageName}@${version}`);
         const localStorage = this._getLocalStorage();
         if (!localStorage) return;
         localStorage.removeTarball(
@@ -1170,8 +1414,8 @@ class Attestations {
     app.get(NPM_KEYS_PATH, (req, res) => {
       res.status(200).json({
         keys: [
-          ...this._upstreamKeysCache.values(),
           ...this.signingKeys.map(key => key.publicKeyEntry),
+          ...[...this._upstreamKeysCache.values()].map(({entry}) => entry),
         ],
       });
     });
@@ -1185,9 +1429,33 @@ class Attestations {
   // generic per-package blob storage the tarball itself uses, and injects
   // dist.attestations into the version metadata in the same request body --
   // so Verdaccio's own addVersion() persists it with no separate hook.
+  //
+  // Runs only for a real publish (_attachments and versions both objects)
+  // from someone Verdaccio would let publish this package; anything else
+  // passes through untouched for Verdaccio to accept or reject.
+  async _handlePublish(req, res, packageName) {
+    const body = req.body;
+    if (!isPlainObject(body?._attachments) || !isPlainObject(body?.versions)) {
+      return; // not a real publish (e.g. deprecate/star)
+    }
+    const version = Object.keys(body.versions)[0];
+    if (!version) return;
+    if (!(await this._canPublish(req, packageName, version))) return;
+    await this._interceptPublish(req, res, packageName);
+  }
+
   async _interceptPublish(req, res, packageName) {
     const body = req.body;
-    if (!body?._attachments || !body?.versions) return; // not a real publish (e.g. deprecate/star)
+
+    // Only this plugin writes dist.attestations and dist.signatures. Clear
+    // whatever the client sent on every version in the body, provenance or
+    // not, so a publisher can't hand-write either.
+    for (const meta of Object.values(body.versions)) {
+      if (isPlainObject(meta?.dist)) {
+        delete meta.dist.attestations;
+        delete meta.dist.signatures;
+      }
+    }
 
     const sigstoreKey = Object.keys(body._attachments).find(k =>
       k.endsWith('.sigstore'),
@@ -1196,7 +1464,14 @@ class Attestations {
 
     const version = Object.keys(body.versions)[0];
     const versionMeta = body.versions[version];
-    if (!packageName || !version || !versionMeta) return;
+    if (
+      !packageName ||
+      !version ||
+      !isPlainObject(versionMeta) ||
+      (versionMeta.dist !== undefined && !isPlainObject(versionMeta.dist))
+    ) {
+      return;
+    }
 
     let bundle;
     try {
@@ -1215,7 +1490,9 @@ class Attestations {
       // attachment's `data`, which silently broke every real
       // --provenance publish (decoding valid JSON text as base64 produces
       // garbage bytes, logged as "unparseable .sigstore attachment").
-      bundle = JSON.parse(body._attachments[sigstoreKey].data);
+      bundle = JSON.parse(body._attachments[sigstoreKey]?.data);
+      if (!isPlainObject(bundle))
+        throw new Error('bundle is not a JSON object');
     } catch (err) {
       this.logger.warn(
         {pkg: packageName, ver: version, err: err.message},
@@ -1226,20 +1503,36 @@ class Attestations {
     }
 
     const integrity = versionMeta.dist?.integrity;
-    const result = integrity
-      ? await verifyBundle(
-          {name: packageName, version, integrity},
-          bundle,
-          this.sigstoreOptions,
-          // Empty (the default, unconfigured) means no identity check --
-          // verifyBundle() treats a truthy-but-empty array as "matches
-          // nothing", so this must be null, not [], to mean "not enforced".
-          this.trustedPublishers.length > 0 ? this.trustedPublishers : null,
-        )
-      : {
-          verified: false,
-          reason: 'no dist.integrity on published version metadata',
-        };
+    let result;
+    if (typeof integrity !== 'string' || integrity === '') {
+      result = {
+        verified: false,
+        reason: 'no dist.integrity on published version metadata',
+      };
+    } else if (!sha512Digest(integrity)) {
+      result = {
+        verified: false,
+        reason: 'dist.integrity is not a single sha512 digest',
+      };
+    } else if (!this._tarballMatchesIntegrity(body, sigstoreKey, integrity)) {
+      // dist.integrity is what the bundle and our signature vouch for, and
+      // the client wrote it. Verdaccio itself checks only the sha1 shasum,
+      // and only when one is sent, so the uploaded bytes are checked here.
+      result = {
+        verified: false,
+        reason: 'uploaded tarball does not match dist.integrity',
+      };
+    } else {
+      result = await verifyBundle(
+        {name: packageName, version, integrity},
+        bundle,
+        this.sigstoreOptions,
+        // Empty (the default, unconfigured) means no identity check --
+        // verifyBundle() treats a truthy-but-empty array as "matches
+        // nothing", so this must be null, not [], to mean "not enforced".
+        this.trustedPublishers.length > 0 ? this.trustedPublishers : null,
+      );
+    }
 
     // Deferred to the response's own 'finish' event, not stored inline here:
     // for a brand-new package's very first publish, the package has no
@@ -1255,29 +1548,46 @@ class Attestations {
     // downstream check (e.g. security-filter's own gate) ends up rejecting
     // never gets an orphaned verdict object stored for a version that was
     // never actually published.
+    //
+    // The in-memory verdict is set here too, not before: every plugin
+    // middleware runs before Verdaccio's own publish handler, so a verdict
+    // cached any earlier would outlive a publish Verdaccio went on to
+    // reject. A transient result (sigstore.verify() couldn't finish) is not
+    // a verdict; its bundle is still stored, marked transient, so a later
+    // read verifies it again instead of losing it.
+    const identityChecked = this.trustedPublishers.length > 0;
     res.on('finish', () => {
       if (res.statusCode >= 300) return;
+      if (!result.transient) {
+        this._cacheVerdict(packageName, version, integrity, result);
+      }
       // One stored object, named by verdict -- not stored separately from
       // the packument's own dist.attestations below, but kept independent
       // of it too: discoverable directly from storage (e.g. for tooling or
       // a rebuild) and reuses the exact same lookup path proxied packages
-      // rely on via _readStoredVerdict(). Tracked via _trackBackground, the
-      // same mechanism the background verdict-resolution path already uses,
-      // so a caller (tests, mainly) can deterministically await it via
+      // rely on via _readStoredVerdict(). Tracked via _trackBackground, so a
+      // caller (tests, mainly) can deterministically await it via
       // whenAllBackgroundWorkSettles() instead of racing the 'finish' event
       // against this fire-and-forget write actually completing.
       this._trackBackground(
         `publish:${packageName}@${version}`,
-        this._storeVerdictAndBundle(packageName, version, bundle, result).catch(
-          err =>
-            this.logger.error(
-              {pkg: packageName, ver: version, err: err.message},
-              'verdaccio-attestations: failed to store attestation bundle/verdict',
-            ),
+        this._storeVerdictAndBundle(
+          packageName,
+          version,
+          integrity,
+          bundle,
+          result,
+          {
+            identityChecked,
+          },
+        ).catch(err =>
+          this.logger.error(
+            {pkg: packageName, ver: version, err: err.message},
+            'verdaccio-attestations: failed to store attestation bundle/verdict',
+          ),
         ),
       );
     });
-    this._verdictCache.set(`${packageName}@${version}`, result);
 
     versionMeta.dist = versionMeta.dist ?? {};
     versionMeta.dist.attestations = {
@@ -1336,6 +1646,23 @@ class Attestations {
         ? 'verdaccio-attestations: publish attestation verified for @{pkg}@@{ver}'
         : 'verdaccio-attestations: publish attestation FAILED verification for @{pkg}@@{ver} (@{reason})',
     );
+  }
+
+  // A publish carries exactly one attachment besides the .sigstore bundle:
+  // the tarball, base64. True only when its bytes match integrity's single
+  // sha512 digest (see sha512Digest() in verify.js).
+  _tarballMatchesIntegrity(body, sigstoreKey, integrity) {
+    const expected = sha512Digest(integrity);
+    if (!expected) return false;
+    const keys = Object.keys(body._attachments).filter(k => k !== sigstoreKey);
+    if (keys.length !== 1) return false;
+    const data = body._attachments[keys[0]]?.data;
+    if (typeof data !== 'string') return false;
+    return crypto
+      .createHash('sha512')
+      .update(Buffer.from(data, 'base64'))
+      .digest()
+      .equals(expected);
   }
 
   _storeRaw(packageName, filename, buffer) {
@@ -1413,14 +1740,20 @@ class Attestations {
     }
     const {name, version} = parsed;
 
+    // Verdaccio's own GET /:package checks access; this route has to as
+    // well, or a package restricted to some users would have its version,
+    // tarball digest and build identity readable by anyone.
+    const denial = await this._accessDenial(req, name);
+    if (denial) return res.status(denial.status || 403).end();
+
     const stored = await this._readStoredVerdict(name, version);
     if (stored?.bundle)
       return res.status(200).json({attestations: [{bundle: stored.bundle}]});
 
     if (!this._effectiveFetchUpstream()) return res.status(404).end();
     const fetched = await this._fetchFromUpstream(name, version);
-    if (!fetched) return res.status(404).end();
-    return res.status(200).json(fetched);
+    if (fetched.status !== 'ok') return res.status(404).end();
+    return res.status(200).json(fetched.body);
   }
 }
 

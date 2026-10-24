@@ -2,8 +2,18 @@
 
 const sigstore = require('sigstore');
 const npa = require('npm-package-arg');
-const ssri = require('ssri');
 const {minimatch} = require('minimatch');
+
+// The digest in an npm integrity string, as a Buffer, or null unless the
+// string is exactly one "sha512-<base64>" entry, which is what npm writes.
+// An SRI string may list several hashes, and a client accepts a tarball
+// that matches any one of them, so a version listing a second sha512 could
+// be attested for one tarball and installed as another.
+function sha512Digest(integrity) {
+  if (typeof integrity !== 'string') return null;
+  const match = /^sha512-([A-Za-z0-9+/]{86}==)$/.exec(integrity.trim());
+  return match ? Buffer.from(match[1], 'base64') : null;
+}
 
 // The SLSA provenance predicate is the one that actually proves build/source
 // linkage (keyless, verified against Sigstore's own public trust root) --
@@ -61,14 +71,27 @@ function matchesTrustedPublisher(identity, trustedPublishers) {
   });
 }
 
+// sigstore.verify() errors that say something about the bundle itself. Any
+// other error (TUFError when the trust root can't be refreshed,
+// InternalError, or something outside sigstore) means verification didn't
+// finish, so the caller must not record the result as a verdict.
+function isDefiniteSigstoreError(err) {
+  return (
+    err instanceof sigstore.VerificationError ||
+    err instanceof sigstore.PolicyError ||
+    err instanceof sigstore.ValidationError
+  );
+}
+
 // Verifies a single raw Sigstore bundle (the exact shape a publish
 // attachment carries, and the shape of each entry in a GET
 // /-/npm/v1/attestations/... response's attestations[].bundle) against the
 // package it's supposed to belong to. Never throws -- returns
-// {verified, reason} so one malformed/invalid bundle can't take down
-// whichever caller is checking it. predicateType is read from the parsed
-// statement itself, not a caller-supplied label, since the publish-time
-// attachment carries no such label at all.
+// {verified, reason} (plus transient: true when verification couldn't
+// finish) so one malformed/invalid bundle can't take down whichever caller
+// is checking it. predicateType is read from the parsed statement itself,
+// not a caller-supplied label, since the publish-time attachment carries
+// no such label at all.
 //
 // trustedPublishers (an array of {issuer?, subjectAlternativeName?} entries
 // -- see matchesTrustedPublisher() above) is optional and, when given,
@@ -78,11 +101,23 @@ function matchesTrustedPublisher(identity, trustedPublishers) {
 // proxied, third-party one must never pass this: there's no independent,
 // not-also-attacker-controlled source of truth for "the legitimate identity
 // for an arbitrary third-party package").
-async function verifyBundle(
+async function verifyBundle(pkg, bundle, opts = {}, trustedPublishers = null) {
+  try {
+    return await verifyBundleUnguarded(pkg, bundle, opts, trustedPublishers);
+  } catch (err) {
+    return {
+      verified: false,
+      reason: `verification error: ${err?.message}`,
+      transient: true,
+    };
+  }
+}
+
+async function verifyBundleUnguarded(
   {name, version, integrity},
   bundle,
-  opts = {},
-  trustedPublishers = null,
+  opts,
+  trustedPublishers,
 ) {
   let purl;
   try {
@@ -100,6 +135,16 @@ async function verifyBundle(
     return {
       verified: false,
       reason: `unparseable attestation payload: ${err.message}`,
+    };
+  }
+  if (
+    statement === null ||
+    typeof statement !== 'object' ||
+    Array.isArray(statement)
+  ) {
+    return {
+      verified: false,
+      reason: 'attestation payload is not a JSON object',
     };
   }
 
@@ -121,16 +166,14 @@ async function verifyBundle(
     };
   }
 
-  let integrityHexDigest;
-  try {
-    integrityHexDigest = ssri.parse(integrity).hexDigest();
-  } catch (err) {
+  const integrityDigest = sha512Digest(integrity);
+  if (!integrityDigest) {
     return {
       verified: false,
-      reason: `invalid integrity string: ${err.message}`,
+      reason: 'dist.integrity is not a single sha512 digest',
     };
   }
-  if (subject.digest?.sha512 !== integrityHexDigest) {
+  if (subject.digest?.sha512 !== integrityDigest.toString('hex')) {
     return {
       verified: false,
       reason:
@@ -157,6 +200,7 @@ async function verifyBundle(
     return {
       verified: false,
       reason: `signature verification failed: ${err.message}`,
+      ...(isDefiniteSigstoreError(err) ? {} : {transient: true}),
     };
   }
 
@@ -181,12 +225,24 @@ async function verifyBundle(
 // (verified against @actions/core@3.0.1) lists the keyed publish-attestation
 // FIRST and the provenance one second, so a caller that needs to persist
 // "the bundle this verdict is about" cannot assume entries[0] is it.
+//
+// Never throws: an upstream can send anything, and a throw here would
+// reach filter_metadata(). When no entry verifies and any failed
+// transiently, the result is transient, since that entry might have
+// verified.
 async function verifyAttestationsResponse(
   pkg,
   attestationsResponse,
   opts = {},
 ) {
   const entries = attestationsResponse?.attestations ?? [];
+  if (!Array.isArray(entries)) {
+    return {
+      verified: false,
+      reason: 'malformed attestations response (attestations is not an array)',
+      bundle: undefined,
+    };
+  }
   if (entries.length === 0) {
     return {
       verified: false,
@@ -195,17 +251,35 @@ async function verifyAttestationsResponse(
     };
   }
   let lastResult;
-  for (const {bundle} of entries) {
+  let anyTransient = false;
+  for (const entry of entries) {
+    const bundle =
+      entry !== null && typeof entry === 'object' ? entry.bundle : undefined;
+    if (
+      bundle === null ||
+      typeof bundle !== 'object' ||
+      Array.isArray(bundle)
+    ) {
+      lastResult = {
+        verified: false,
+        reason:
+          'malformed attestations response (an entry has no bundle object)',
+        bundle: undefined,
+      };
+      continue;
+    }
     const result = await verifyBundle(pkg, bundle, opts);
     if (result.verified) return {...result, bundle};
+    if (result.transient) anyTransient = true;
     lastResult = {...result, bundle};
   }
-  return lastResult;
+  return anyTransient ? {...lastResult, transient: true} : lastResult;
 }
 
 module.exports = {
   verifyBundle,
   verifyAttestationsResponse,
   matchesTrustedPublisher,
+  sha512Digest,
   SLSA_PROVENANCE_PREDICATE_TYPES,
 };

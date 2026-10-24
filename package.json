@@ -1,9 +1,12 @@
 {
   "name": "@fortmesa/verdaccio-attestations",
-  "version": "1.1.5",
+  "version": "1.2.0",
   "description": "Verdaccio plugin: accepts and stores npm provenance/Sigstore attestations on publish (working around Verdaccio's own single-attachment publish limit), serves them back via the real npm attestations endpoint (proxying and caching from upstream for non-local packages), and optionally enforces that matching packages have a cryptographically verified attestation before they can be installed",
   "license": "MIT",
-  "repository": "fortmesa/verdaccio-attestations",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fortmesa/verdaccio-attestations.git"
+  },
   "homepage": "https://github.com/fortmesa/verdaccio-attestations#readme",
   "keywords": [
     "verdaccio",
@@ -15,7 +18,10 @@
     "sigstore"
   ],
   "main": "index.js",
-  "packageManager": "yarn@4.17.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "yarn@4.18.1+sha512.b2e1e7524f654f2749d32b4ebcb4622473cb5bcbc485df2007e12a154e50162a4d795526768bc5f5b8f81717bfd79deb2472813d86fb5ae2eb551fa9c872b08f",
   "publishConfig": {
     "access": "public"
   },
@@ -35,20 +41,18 @@
     ]
   },
   "dependencies": {
-    "body-parser": "^1.20.5",
+    "body-parser": "~1.20.5",
     "https-proxy-agent": "^9.1.0",
-    "minimatch": "^10.2.5",
-    "node-fetch": "^2.7.0",
+    "minimatch": "^10.2.6",
     "npm-package-arg": "^14.0.0",
     "semver": "^7.8.5",
-    "sigstore": "^5.0.0",
-    "ssri": "^14.0.0"
+    "sigstore": "^5.0.0"
   },
   "devDependencies": {
-    "express": "^5.2.1",
+    "express": "4.22.3",
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.8",
-    "prettier": "^3.3.3",
-    "verdaccio": "^6.0.0"
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10",
+    "verdaccio": "^6.10.7"
   }
 }
